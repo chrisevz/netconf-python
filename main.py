@@ -10,7 +10,7 @@ Requires on the device:
     netconf-yang (IOS XE) / feature netconf (NX-OS)
     (optional) candidate-datastore support   ← enables candidate + commit
 
-Actions: is-alive, run-command, get-config, send-command, reboot
+Actions: netconf-is-alive, netconf-run-command, netconf-get-config, netconf-send-command, netconf-reboot
 
 Platform is resolved from (in order): --platform CLI flag, inventory attribute
 "platform" (e.g. "IOS XE" / "NX-OS"), default "ios-xe" for backward compatibility.
@@ -229,7 +229,7 @@ def is_alive(conn, args) -> dict:
 
 def run_command(conn, args) -> dict:
     if not args.command:
-        return {"success": False, "host": conn["host"], "error": "command is required for action=run-command"}
+        return {"success": False, "host": conn["host"], "error": "command is required for action=netconf-run-command"}
     results = []
     try:
         with _session(conn) as m:
@@ -349,7 +349,7 @@ def send_command(conn, args) -> dict:
     raw_config_xml = getattr(args, "config_xml", None)
     if not args.command and not raw_config_xml:
         return {"success": False, "host": conn["host"], "device_name": device_name,
-                "error": "command or config_xml is required for action=send-command"}
+                "error": "command or config_xml is required for action=netconf-send-command"}
     dry_run = getattr(args, "dry_run", False)
     confirmed = getattr(args, "confirmed", False)
     confirm_timeout = getattr(args, "confirm_timeout", None) or 10
@@ -495,12 +495,12 @@ def reboot(conn, args) -> dict:
 
 
 _DISPATCH = {
-    "is-alive": is_alive,
-    "run-command": run_command,
-    "get-config": get_config,
-    "send-command": send_command,
-    "set-config": send_command,
-    "reboot": reboot,
+    "netconf-is-alive": is_alive,
+    "netconf-run-command": run_command,
+    "netconf-get-config": get_config,
+    "netconf-send-command": send_command,
+    "netconf-set-config": send_command,
+    "netconf-reboot": reboot,
 }
 
 
@@ -724,10 +724,10 @@ def _normalize_args(args):
 
 
 def _format_for_humans(result, op):
-    if op == "is-alive":
+    if op == "netconf-is-alive":
         return "true" if result.get("alive", False) else "false"
 
-    if op == "run-command":
+    if op == "netconf-run-command":
         results = result.get("results") or []
         if not results:
             return f"ERROR: {result.get('error', 'connection failed')}"
@@ -746,12 +746,12 @@ def _format_for_humans(result, op):
                 parts.append(r["output"])
         return "\n".join(parts)
 
-    if op == "get-config":
+    if op == "netconf-get-config":
         if not result.get("success"):
             return f"ERROR: {result.get('error', 'config retrieval failed')}"
         return result.get("config", "")
 
-    if op == "set-config":
+    if op == "netconf-set-config":
         if result.get("success"):
             changes_list = result.get("_changes_list")
             if changes_list:
@@ -780,7 +780,7 @@ def main() -> int:
     conn = _resolve_connection(args, node)
     result = _DISPATCH[args.op](conn, args)
     formatted = _format_for_humans(result, args.op)
-    print(formatted, end="" if args.op == "is-alive" else "\n")
+    print(formatted, end="" if args.op == "netconf-is-alive" else "\n")
     if not result.get("success"):
         print(formatted, file=sys.stderr)
     return 0 if result.get("success") else 1

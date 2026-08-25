@@ -192,7 +192,7 @@ services:
     decorator: netconf-common-input
     runtime:
       env:
-        NETCONF_OP: is-alive
+        NETCONF_OP: netconf-is-alive
     tags: [driver, iosxe, nxos, netconf, cisco]
 
   - name: netconf-run-command
@@ -204,7 +204,7 @@ services:
     decorator: netconf-run-command-input
     runtime:
       env:
-        NETCONF_OP: run-command
+        NETCONF_OP: netconf-run-command
     tags: [driver, iosxe, nxos, netconf, cisco]
 
   - name: netconf-get-config
@@ -216,7 +216,7 @@ services:
     decorator: netconf-get-config-input
     runtime:
       env:
-        NETCONF_OP: get-config
+        NETCONF_OP: netconf-get-config
     tags: [driver, iosxe, nxos, netconf, cisco]
 
   - name: netconf-send-config
@@ -228,7 +228,7 @@ services:
     decorator: netconf-send-config-input
     runtime:
       env:
-        NETCONF_OP: send-command
+        NETCONF_OP: netconf-send-command
     tags: [driver, iosxe, netconf, cisco]
 
   - name: netconf-send-command
@@ -240,7 +240,7 @@ services:
     decorator: netconf-send-command-input
     runtime:
       env:
-        NETCONF_OP: send-command
+        NETCONF_OP: netconf-send-command
     tags: [driver, iosxe, netconf, cisco]
 
   - name: netconf-send-config-xml
@@ -252,7 +252,7 @@ services:
     decorator: netconf-send-config-xml-input
     runtime:
       env:
-        NETCONF_OP: send-command
+        NETCONF_OP: netconf-send-command
     tags: [driver, iosxe, nxos, netconf, cisco]
 
   - name: netconf-reboot
@@ -264,7 +264,7 @@ services:
     decorator: netconf-reboot-input
     runtime:
       env:
-        NETCONF_OP: reboot
+        NETCONF_OP: netconf-reboot
     tags: [driver, iosxe, nxos, netconf, cisco]
 
   - name: netconf-set-config
@@ -276,5 +276,5 @@ services:
     decorator: netconf-set-config-input
     runtime:
       env:
-        NETCONF_OP: set-config
+        NETCONF_OP: netconf-set-config
     tags: [driver, iosxe, netconf, cisco, broker]

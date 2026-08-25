@@ -18,13 +18,13 @@ Resolved in this order:
 
 | Action | Purpose | Notes |
 |---|---|---|
-| `is-alive` | Confirm device responds to NETCONF | IOS XE: reads native-model version via `<get>`. NX-OS: successful capability exchange is the proof — no NX-OS YANG container is assumed present, since supported versions span 8.2(6a) through 10.4(4). |
-| `run-command` | Execute exec-mode CLI commands | IOS XE: `cisco-ia` exec RPC. NX-OS: ncclient's native `exec_command()` (legacy `nxos:1.0` namespace) — **not universally supported**; devices that only expose the native `Cisco-NX-OS-device` YANG model (confirmed on NX-OS 9.2(4)) will fail this cleanly with a message pointing at structured `<get>` instead. |
-| `get-config` | Retrieve running or candidate configuration | Fully generic — `xml` format works identically on both platforms with zero platform-specific code. `text`/`set` formats go through `run-command`'s exec path (IOS XE only, currently). |
-| `send-command` | Apply config and commit | See below — two input modes. |
-| `reboot` | Schedule a reload | Goes through the same exec-command path as `run-command`; same NX-OS caveat applies. NX-OS `reload` interactive-confirmation behavior via `exec_command()` is unvalidated. |
+| `netconf-is-alive` | Confirm device responds to NETCONF | IOS XE: reads native-model version via `<get>`. NX-OS: successful capability exchange is the proof — no NX-OS YANG container is assumed present, since supported versions span 8.2(6a) through 10.4(4). |
+| `netconf-run-command` | Execute exec-mode CLI commands | IOS XE: `cisco-ia` exec RPC. NX-OS: ncclient's native `exec_command()` (legacy `nxos:1.0` namespace) — **not universally supported**; devices that only expose the native `Cisco-NX-OS-device` YANG model (confirmed on NX-OS 9.2(4)) will fail this cleanly with a message pointing at structured `<get>` instead. |
+| `netconf-get-config` | Retrieve running or candidate configuration | Fully generic — `xml` format works identically on both platforms with zero platform-specific code. `text`/`set` formats go through `netconf-run-command`'s exec path (IOS XE only, currently). |
+| `netconf-send-command` | Apply config and commit | See below — two input modes. |
+| `netconf-reboot` | Schedule a reload | Goes through the same exec-command path as `netconf-run-command`; same NX-OS caveat applies. NX-OS `reload` interactive-confirmation behavior via `exec_command()` is unvalidated. |
 
-## send-command: two input modes
+## netconf-send-command: two input modes
 
 **1. Raw CLI commands (`--command` / `--commands`)** — IOS XE only. Wraps commands in
 `cli-config-data`, a Cisco IOS XE-specific tag that lets `edit-config` parse raw CLI text as
@@ -96,14 +96,14 @@ invoked through an inventory action.
 
 | Service name | Operation | Notes |
 |---|---|---|
-| `netconf-is-alive` | is-alive | No runtime args needed |
-| `netconf-run-command` | run-command | Workflow passes `command`. NX-OS support device-dependent — see caveat above |
-| `netconf-get-config` | get-config | Optional `source`, `filter`, `config_format` |
-| `netconf-send-config` | send-command | Workflow passes `config` (multi-line block) — IOS XE only |
-| `netconf-send-command` | send-command | Workflow passes `commands` (array) — IOS XE only |
-| `netconf-send-config-xml` | send-command | Workflow passes `config_xml` (raw payload) — generic, any platform |
-| `netconf-reboot` | reboot | Optional `at`, `message` |
-| `netconf-set-config` | set-config | Config Manager remediation broker entry point |
+| `netconf-is-alive` | netconf-is-alive | No runtime args needed |
+| `netconf-run-command` | netconf-run-command | Workflow passes `command`. NX-OS support device-dependent — see caveat above |
+| `netconf-get-config` | netconf-get-config | Optional `source`, `filter`, `config_format` |
+| `netconf-send-config` | netconf-send-command | Workflow passes `config` (multi-line block) — IOS XE only |
+| `netconf-send-command` | netconf-send-command | Workflow passes `commands` (array) — IOS XE only |
+| `netconf-send-config-xml` | netconf-send-command | Workflow passes `config_xml` (raw payload) — generic, any platform |
+| `netconf-reboot` | netconf-reboot | Optional `at`, `message` |
+| `netconf-set-config` | netconf-set-config | Config Manager remediation broker entry point |
 
 ### From iagctl
 
@@ -129,7 +129,7 @@ iagctl run service python-script netconf-reboot \
 
 ```json
 {
-  "name": "run-command",
+  "name": "netconf-run-command",
   "action_type": "iag5-service",
   "action_config": {
     "service_name": "netconf-run-command",
@@ -151,27 +151,27 @@ iagctl run service python-script netconf-reboot \
 ### Direct local testing
 
 ```bash
-NETCONF_OP=is-alive python main.py \
+NETCONF_OP=netconf-is-alive python main.py \
   --platform "IOS XE" --host 192.0.2.1 --user admin --password "$PASS"
 
-NETCONF_OP=is-alive python main.py \
+NETCONF_OP=netconf-is-alive python main.py \
   --platform "NX-OS" --host 192.0.2.2 --user admin --password "$PASS"
 
-NETCONF_OP=send-command python main.py \
+NETCONF_OP=netconf-send-command python main.py \
   --platform "IOS XE" --host 192.0.2.1 --user admin --password "$PASS" \
   --command "interface GigabitEthernet1" \
   --command "description managed-by-itential"
 
-NETCONF_OP=send-command python main.py \
+NETCONF_OP=netconf-send-command python main.py \
   --platform "NX-OS" --host 192.0.2.2 --user admin --password "$PASS" \
   --config_xml '<config><System xmlns="http://cisco.com/ns/yang/cisco-nx-os-device">...</System></config>'
 ```
 
 CLI flags win over stdin values when both are present.
 
-## Candidate datastore locking (send-command)
+## Candidate datastore locking (netconf-send-command)
 
-`send-command` auto-detects whether the device advertises the candidate datastore capability.
+`netconf-send-command` auto-detects whether the device advertises the candidate datastore capability.
 If present, it takes an exclusive lock before loading config. If not, config is applied
 directly to `running`.
 
@@ -197,7 +197,7 @@ the inventory:
 }
 ```
 
-`command_timeout` only applies to `run-command`.
+`command_timeout` only applies to `netconf-run-command`.
 
 ## Recommended inventory attributes
 
@@ -243,5 +243,5 @@ Port 830 must be reachable from the IAG5 host.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python main.py --op is-alive --platform "IOS XE" --host 192.0.2.1 --user admin --password "$PASS"
+python main.py --op netconf-is-alive --platform "IOS XE" --host 192.0.2.1 --user admin --password "$PASS"
 ```
