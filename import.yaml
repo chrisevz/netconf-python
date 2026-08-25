@@ -2,8 +2,8 @@
 repositories:
   - name: itential-assets
     description: Itential community assets repository
-    url: https://github.com/itential/assets.git
-    reference: devel
+    url: https://github.com/chrisevz/netconf-python.git
+    reference: main
 
 decorators:
   - name: netconf-common-input
