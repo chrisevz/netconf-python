@@ -48,6 +48,9 @@ decorators:
         filter:
           description: Optional XML subtree filter (xml format only)
           type: string
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 30.
+          type: integer
       additionalProperties: false
 
   - name: netconf-send-config-input
