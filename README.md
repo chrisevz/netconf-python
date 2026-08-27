@@ -21,6 +21,7 @@ Resolved in this order:
 | `netconf-is-alive` | Confirm device responds to NETCONF | IOS XE: reads native-model version via `<get>`. NX-OS: successful capability exchange is the proof — no NX-OS YANG container is assumed present, since supported versions span 8.2(6a) through 10.4(4). |
 | `netconf-run-command` | Execute exec-mode CLI commands | IOS XE: `cisco-ia` exec RPC. NX-OS: ncclient's native `exec_command()` (legacy `nxos:1.0` namespace) — **not universally supported**; devices that only expose the native `Cisco-NX-OS-device` YANG model (confirmed on NX-OS 9.2(4)) will fail this cleanly with a message pointing at structured `<get>` instead. |
 | `netconf-get-config` | Retrieve running or candidate configuration | Fully generic — `xml` format works identically on both platforms with zero platform-specific code. `text`/`set` formats go through `netconf-run-command`'s exec path (IOS XE only, currently). |
+| `netconf-get-config-clis` | Render running or candidate as CLI text | IOS XE only. Uses `get-modelled-config-clis` (`Cisco-IOS-XE-cli-rpc`) — the device's own modelled-config-to-CLI renderer, not a screen-scrape. This is the mechanism behind an operator CLI preview; unlike `netconf-get-config`'s `text`/`set` formats it can render `candidate`, not just `running`. See "CLI preview" section below. |
 | `netconf-send-command` | Apply config and commit | See below — two input modes. |
 | `netconf-reboot` | Schedule a reload | Goes through the same exec-command path as `netconf-run-command`; same NX-OS caveat applies. NX-OS `reload` interactive-confirmation behavior via `exec_command()` is unvalidated. |
 
@@ -53,6 +54,34 @@ after starting the timer — there's no follow-up call anywhere in this driver t
 actual confirming commit (which would need either a same-session call or `persist`/
 `persist_id` to survive across sessions). This needs to be wired up before `confirmed=True`
 is relied on for real rollback protection on *any* platform, IOS XE included.
+
+## CLI preview (netconf-get-config-clis)
+
+Validated live against a Catalyst C9500 (IOS XE 17.15.05): schema retrieved via
+`<get-schema>` (5709 bytes — the module is **not** advertised in the NETCONF hello even
+though it's present and works; capability-list absence is not evidence of absence for
+RPC-only modules). Two consecutive `running` renders were byte-identical (42,799 chars /
+1,830 lines, `difflib` diff = 0 lines) — render is deterministic, no timestamps/counters
+leak in, no normalization needed before diffing. Latency was ~17s for that render; the
+`timeout` input (default 90) leaves margin for larger configs.
+
+**Known caveats, still open:**
+- The rendered CLI text includes credential material (`enable secret 9 ...` appeared in
+  the first 40 lines; TACACS+ keys are also likely present). If this ever lands in a P6
+  task variable shown to an operator, it needs masking/scrubbing before that happens —
+  this driver does not currently do that.
+- Cisco's docs say wireless/app-hosting/telemetry config is not supported through this
+  RPC. Whether that means the RPC errors or silently omits that config from the render is
+  **not yet confirmed**. `get_config_clis` surfaces a non-empty `error-message` output leaf
+  as a `warning` alongside a successful result (rather than swallowing it), but an omission
+  with no `error-message` at all would currently go unnoticed.
+- `Cisco-IOS-XE-cli-preview-rpc` (a different module, `candidate-preview` RPC) was
+  confirmed genuinely absent on the same device (`<get-schema>` → `inconsistent value`
+  RPCError) — don't build against it.
+- Whether a `candidate` staged in one NETCONF session (e.g. via `netconf-send-command`
+  with a future `do_commit=false`) survives session close so it can be rendered from a
+  *separate* session later is unvalidated on IOS XE 17.15. This matters for any workflow
+  with an operator approval gate between staging and preview/commit.
 
 ## get-config format options
 
@@ -99,6 +128,7 @@ invoked through an inventory action.
 | `netconf-is-alive` | netconf-is-alive | No runtime args needed |
 | `netconf-run-command` | netconf-run-command | Workflow passes `command`. NX-OS support device-dependent — see caveat above |
 | `netconf-get-config` | netconf-get-config | Optional `source`, `filter`, `config_format` |
+| `netconf-get-config-clis` | netconf-get-config-clis | Optional `datastore` (`running`/`candidate`). IOS XE only |
 | `netconf-send-config` | netconf-send-command | Workflow passes `config` (multi-line block) — IOS XE only |
 | `netconf-send-command` | netconf-send-command | Workflow passes `commands` (array) — IOS XE only |
 | `netconf-send-config-xml` | netconf-send-command | Workflow passes `config_xml` (raw payload) — generic, any platform |
@@ -182,14 +212,14 @@ directly to `running`.
 
 ## Long-running commands
 
-For commands that take longer than the default 30s session timeout, set `command_timeout` in
+For commands that take longer than the default 90s session timeout, set `command_timeout` in
 the inventory:
 
 ```json
 "itential_driver_options": {
   "netconf": {
     "port": 830,
-    "timeout": 30,
+    "timeout": 90,
     "command_timeout": 120,
     "lock_timeout": 60,
     "lock_poll_interval": 2
@@ -212,7 +242,7 @@ the inventory:
     "itential_driver_options": {
       "netconf": {
         "port": 830,
-        "timeout": 30,
+        "timeout": 90,
         "command_timeout": 60,
         "lock_timeout": 30,
         "lock_poll_interval": 2,

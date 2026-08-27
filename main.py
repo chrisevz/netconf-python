@@ -10,7 +10,8 @@ Requires on the device:
     netconf-yang (IOS XE) / feature netconf (NX-OS)
     (optional) candidate-datastore support   ← enables candidate + commit
 
-Actions: netconf-is-alive, netconf-run-command, netconf-get-config, netconf-send-command, netconf-reboot
+Actions: netconf-is-alive, netconf-run-command, netconf-get-config, netconf-get-config-clis,
+netconf-send-command, netconf-reboot
 
 Platform is resolved from (in order): --platform CLI flag, inventory attribute
 "platform" (e.g. "IOS XE" / "NX-OS"), default "ios-xe" for backward compatibility.
@@ -44,6 +45,12 @@ from ncclient.transport.errors import AuthenticationError, SSHError
 
 # Cisco IOS XE exec-command RPC namespace (cisco-ia YANG module)
 _CISCO_IA_NS = "http://cisco.com/yang/cisco-ia"
+
+# Cisco IOS XE get-modelled-config-clis RPC namespace (Cisco-IOS-XE-cli-rpc YANG
+# module, revision 2024-07-01). RPC-only module — not advertised in the NETCONF
+# hello capability list even when present, so don't gate on capability checks;
+# just call it and handle unknown-element the same way exec-command does.
+_CLI_RPC_NS = "http://cisco.com/ns/yang/Cisco-IOS-XE-cli-rpc"
 
 _PLATFORM_IOSXE = "ios-xe"
 _PLATFORM_NXOS = "nx-os"
@@ -284,6 +291,84 @@ def get_config(conn, args) -> dict:
         return {"success": False, "host": conn["host"], "error": str(e), "error_type": type(e).__name__}
 
 
+def _get_modelled_config_clis(m, datastore: str = "running"):
+    """Call get-modelled-config-clis and return (result_text, error_message).
+
+    This is the RPC behind the operator CLI preview: it renders a whole datastore
+    (running or candidate) as CLI text via the device's own modelled-config-to-CLI
+    conversion — not a screen-scrape of an exec command, and not limited to
+    running like the exec-based get-config text/set formats are.
+
+    error_message is a normal *output leaf* on a successful RPC reply (the device
+    telling us it couldn't render something, e.g. wireless/app-hosting/telemetry
+    per Cisco's own docs) — distinct from an RPCError, which means the RPC itself
+    failed at the transport/protocol level.
+    """
+    rpc_xml = (
+        f'<get-modelled-config-clis xmlns="{_CLI_RPC_NS}">'
+        f"<datastore>{datastore}</datastore>"
+        f"</get-modelled-config-clis>"
+    )
+    try:
+        reply = m.dispatch(to_ele(rpc_xml))
+    except RPCError as e:
+        tag = getattr(e, "tag", "") or ""
+        if "unknown-element" in tag or "unknown-element" in str(e):
+            return None, (
+                "get-modelled-config-clis RPC not supported on this device — "
+                "requires the Cisco-IOS-XE-cli-rpc YANG module."
+            )
+        raise
+    xml_str = reply.xml if hasattr(reply, "xml") else str(reply)
+    tree = _etree.fromstring(xml_str.encode() if isinstance(xml_str, str) else xml_str)
+    result_nodes = tree.xpath(".//*[local-name()='result']")
+    error_nodes = tree.xpath(".//*[local-name()='error-message']")
+    result = result_nodes[0].text if result_nodes and result_nodes[0].text else None
+    error = error_nodes[0].text if error_nodes and error_nodes[0].text else None
+    return result, error
+
+
+def get_config_clis(conn, args) -> dict:
+    """Render a datastore as CLI text via get-modelled-config-clis — the actual
+    mechanism behind the operator CLI preview (see netconf-driver-handoff doc §3).
+    IOS XE only; NX-OS does not have this RPC."""
+    datastore = args.source or "running"
+    if conn["platform"] != _PLATFORM_IOSXE:
+        return {
+            "success": False,
+            "host": conn["host"],
+            "datastore": datastore,
+            "error": "get-modelled-config-clis is IOS XE only — not available on NX-OS.",
+            "error_type": "NotImplementedError",
+        }
+    try:
+        with _session(conn) as m:
+            result, error = _get_modelled_config_clis(m, datastore)
+            if error and result is None:
+                return {
+                    "success": False,
+                    "host": conn["host"],
+                    "datastore": datastore,
+                    "error": error,
+                    "error_type": "RPCError",
+                }
+            return {
+                "success": True,
+                "host": conn["host"],
+                "datastore": datastore,
+                "config": result or "",
+                # Surfaced even on success — a non-empty error-message alongside a
+                # result can mean partial render (e.g. an unsupported feature was
+                # skipped rather than raising). Don't swallow it (§5.4 — whether
+                # unsupported features error or silently omit is still unconfirmed
+                # per-platform; this at least reports it when the device does tell us).
+                "warning": error,
+            }
+    except Exception as e:
+        return {"success": False, "host": conn["host"], "datastore": datastore,
+                "error": str(e), "error_type": type(e).__name__}
+
+
 def _build_cli_config_xml_iosxe(commands: list) -> str:
     """Build a NETCONF <config> payload using Cisco IOS XE cli-config-data.
 
@@ -498,6 +583,7 @@ _DISPATCH = {
     "netconf-is-alive": is_alive,
     "netconf-run-command": run_command,
     "netconf-get-config": get_config,
+    "netconf-get-config-clis": get_config_clis,
     "netconf-send-command": send_command,
     "netconf-set-config": send_command,
     "netconf-reboot": reboot,
@@ -617,7 +703,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "as long as the XML is valid for that device's YANG model.")
     parser.add_argument("--changes", default=None)
     parser.add_argument("--options", default=None)
-    parser.add_argument("--source", default=None)
+    parser.add_argument("--source", "--datastore", dest="source", default=None)
     parser.add_argument("--filter", default=None)
     parser.add_argument("--at", default=None, help="Minutes from now for reload (e.g. '5')")
     parser.add_argument("--message", default=None, help="Optional reason string for reload")
@@ -750,6 +836,14 @@ def _format_for_humans(result, op):
         if not result.get("success"):
             return f"ERROR: {result.get('error', 'config retrieval failed')}"
         return result.get("config", "")
+
+    if op == "netconf-get-config-clis":
+        if not result.get("success"):
+            return f"ERROR: {result.get('error', 'CLI render failed')}"
+        text = result.get("config", "")
+        if result.get("warning"):
+            text = f"{text}\n\n# WARNING: {result['warning']}"
+        return text
 
     if op == "netconf-set-config":
         if result.get("success"):

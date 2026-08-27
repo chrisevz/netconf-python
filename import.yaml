@@ -40,6 +40,25 @@ decorators:
       required: [command]
       additionalProperties: false
 
+  - name: netconf-get-config-clis-input
+    schema:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      title: netconf-get-config-clis inputs
+      type: object
+      properties:
+        platform:
+          description: "'IOS XE' or 'NX-OS'. NX-OS returns a clean not-implemented error — this op is IOS XE only (get-modelled-config-clis has no NX-OS equivalent)."
+          type: string
+        datastore:
+          description: Datastore to render as CLI text via get-modelled-config-clis (running or candidate). Empty = running.
+          type: string
+          enum: ["", running, candidate]
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. A full running-config render was measured at ~17s on a live device; default is generous to leave margin for larger configs.
+          type: integer
+          default: 90
+      additionalProperties: false
+
   - name: netconf-get-config-input
     schema:
       $schema: https://json-schema.org/draft/2020-12/schema
@@ -236,6 +255,17 @@ services:
       env:
         NETCONF_OP: netconf-run-command
     tags: [driver, iosxe, nxos, netconf, cisco]
+
+  - name: netconf-get-config-clis
+    type: python-script
+    description: Cisco NETCONF (IOS XE only) — render running or candidate as CLI text via get-modelled-config-clis. This is the mechanism behind the operator CLI preview.
+    repository: netconf-python
+    filename: main.py
+    decorator: netconf-get-config-clis-input
+    runtime:
+      env:
+        NETCONF_OP: netconf-get-config-clis
+    tags: [driver, iosxe, netconf, cisco, preview]
 
   - name: netconf-get-config
     type: python-script
