@@ -15,6 +15,10 @@ decorators:
         platform:
           description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
           type: string
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
       additionalProperties: true
 
   - name: netconf-run-command-input
@@ -29,6 +33,10 @@ decorators:
         command:
           description: Exec-mode CLI command to run (e.g. "show version"). NX-OS support is device-dependent — devices exposing only the native Cisco-NX-OS-device YANG model do not support this.
           type: string
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
       required: [command]
       additionalProperties: false
 
@@ -49,8 +57,9 @@ decorators:
           description: Optional XML subtree filter (xml format only)
           type: string
         timeout:
-          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 30.
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
           type: integer
+          default: 90
       additionalProperties: false
 
   - name: netconf-send-config-input
@@ -83,6 +92,10 @@ decorators:
           description: Seconds before auto-rollback for a confirmed commit (NETCONF confirm-timeout is defined in seconds, not minutes)
           type: integer
           default: 10
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
       additionalProperties: false
 
   - name: netconf-send-command-input
@@ -117,6 +130,10 @@ decorators:
           description: Seconds before auto-rollback for confirmed commit
           type: integer
           default: 10
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
       required: [commands]
       additionalProperties: false
 
@@ -150,6 +167,10 @@ decorators:
           description: Seconds before auto-rollback for confirmed commit
           type: integer
           default: 10
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
       required: [config_xml]
       additionalProperties: false
 
@@ -168,6 +189,10 @@ decorators:
         message:
           description: Optional reason string logged with the reload
           type: string
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
       additionalProperties: false
 
   - name: netconf-set-config-input
@@ -182,6 +207,10 @@ decorators:
         config:
           description: JSON-encoded Config Manager changes array [{parents, old, new}]
           type: string
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
       required: [config]
       additionalProperties: false
 

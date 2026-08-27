@@ -542,7 +542,7 @@ def _resolve_connection(args, node):
     user = pick(args.user, ("itential_user",))
     password = pick(args.password, ("itential_password",))
     port = pick(args.port, ("itential_driver_options", "netconf", "port"), default=830)
-    timeout = pick(args.timeout, ("itential_driver_options", "netconf", "timeout"), default=30)
+    timeout = pick(args.timeout, ("itential_driver_options", "netconf", "timeout"), default=90)
     command_timeout = pick(args.command_timeout, ("itential_driver_options", "netconf", "command_timeout"), default=None)
     config_format = pick(args.config_format, ("itential_driver_options", "netconf", "config_format"), default=None)
     lock_timeout = pick(args.lock_timeout, ("itential_driver_options", "netconf", "lock_timeout"), default=30)
