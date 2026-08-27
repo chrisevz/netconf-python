@@ -1,7 +1,7 @@
 ---
 repositories:
-  - name: itential-assets
-    description: Itential community assets repository
+  - name: netconf-python
+    description: Cisco NETCONF Python driver (IOS XE / NX-OS)
     url: https://github.com/chrisevz/netconf-python.git
     reference: main
 
@@ -42,9 +42,9 @@ decorators:
           description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
           type: string
         source:
-          description: Datastore to read from (running or candidate)
+          description: Datastore to read from (running or candidate). Empty = running.
           type: string
-          enum: [running, candidate]
+          enum: ["", running, candidate]
         filter:
           description: Optional XML subtree filter (xml format only)
           type: string
@@ -67,14 +67,14 @@ decorators:
           type: integer
           default: 30
         dry_run:
-          description: Validate config against candidate datastore without committing (requires candidate datastore capability)
+          description: Validate config against candidate datastore without committing (requires candidate datastore capability). Empty = false.
           type: string
-          enum: ["true", "false"]
+          enum: ["", "true", "false"]
           default: "false"
         confirmed:
           description: "Use a confirmed commit. CAUTION — confirmed rollback-on-timeout was tested and found unreliable on at least one NX-OS image; do not treat this as a proven safety net without re-validating against the target platform/version."
           type: string
-          enum: ["true", "false"]
+          enum: ["", "true", "false"]
           default: "false"
         confirm_timeout:
           description: Seconds before auto-rollback for a confirmed commit (NETCONF confirm-timeout is defined in seconds, not minutes)
@@ -101,14 +101,14 @@ decorators:
           type: integer
           default: 30
         dry_run:
-          description: Validate without committing (requires candidate datastore)
+          description: Validate without committing (requires candidate datastore). Empty = false.
           type: string
-          enum: ["true", "false"]
+          enum: ["", "true", "false"]
           default: "false"
         confirmed:
           description: "Use a confirmed commit. CAUTION — see netconf-send-config-input notes on confirmed-commit reliability."
           type: string
-          enum: ["true", "false"]
+          enum: ["", "true", "false"]
           default: "false"
         confirm_timeout:
           description: Seconds before auto-rollback for confirmed commit
@@ -134,14 +134,14 @@ decorators:
           type: integer
           default: 30
         dry_run:
-          description: Validate without committing (requires candidate datastore)
+          description: Validate without committing (requires candidate datastore). Empty = false.
           type: string
-          enum: ["true", "false"]
+          enum: ["", "true", "false"]
           default: "false"
         confirmed:
           description: "Use a confirmed commit. CAUTION — see netconf-send-config-input notes on confirmed-commit reliability."
           type: string
-          enum: ["true", "false"]
+          enum: ["", "true", "false"]
           default: "false"
         confirm_timeout:
           description: Seconds before auto-rollback for confirmed commit
@@ -186,8 +186,7 @@ services:
   - name: netconf-is-alive
     type: python-script
     description: Cisco NETCONF (IOS XE / NX-OS) — verify reachability via NETCONF session
-    repository: itential-assets
-    working-directory: Cisco/device-drivers/netconf-python
+    repository: netconf-python
     filename: main.py
     decorator: netconf-common-input
     runtime:
@@ -198,8 +197,7 @@ services:
   - name: netconf-run-command
     type: python-script
     description: Cisco NETCONF (IOS XE / NX-OS) — execute exec-mode CLI commands
-    repository: itential-assets
-    working-directory: Cisco/device-drivers/netconf-python
+    repository: netconf-python
     filename: main.py
     decorator: netconf-run-command-input
     runtime:
@@ -210,8 +208,7 @@ services:
   - name: netconf-get-config
     type: python-script
     description: Cisco NETCONF (IOS XE / NX-OS) — retrieve running or candidate configuration
-    repository: itential-assets
-    working-directory: Cisco/device-drivers/netconf-python
+    repository: netconf-python
     filename: main.py
     decorator: netconf-get-config-input
     runtime:
@@ -222,8 +219,7 @@ services:
   - name: netconf-send-config
     type: python-script
     description: Cisco NETCONF — apply multi-line CLI config block via cli-config-data (IOS XE only)
-    repository: itential-assets
-    working-directory: Cisco/device-drivers/netconf-python
+    repository: netconf-python
     filename: main.py
     decorator: netconf-send-config-input
     runtime:
@@ -234,8 +230,7 @@ services:
   - name: netconf-send-command
     type: python-script
     description: Cisco NETCONF — apply an array of raw CLI commands via cli-config-data (IOS XE only)
-    repository: itential-assets
-    working-directory: Cisco/device-drivers/netconf-python
+    repository: netconf-python
     filename: main.py
     decorator: netconf-send-command-input
     runtime:
@@ -246,8 +241,7 @@ services:
   - name: netconf-send-config-xml
     type: python-script
     description: Cisco NETCONF (IOS XE / NX-OS) — push a pre-built NETCONF <config> XML payload as-is via candidate/commit. The generic, platform-agnostic config-push path.
-    repository: itential-assets
-    working-directory: Cisco/device-drivers/netconf-python
+    repository: netconf-python
     filename: main.py
     decorator: netconf-send-config-xml-input
     runtime:
@@ -258,8 +252,7 @@ services:
   - name: netconf-reboot
     type: python-script
     description: Cisco NETCONF (IOS XE / NX-OS) — schedule device reload via exec RPC
-    repository: itential-assets
-    working-directory: Cisco/device-drivers/netconf-python
+    repository: netconf-python
     filename: main.py
     decorator: netconf-reboot-input
     runtime:
@@ -270,8 +263,7 @@ services:
   - name: netconf-set-config
     type: python-script
     description: Cisco NETCONF — Config Manager remediation via IM iag5-service action (broker entry point, IOS XE only)
-    repository: itential-assets
-    working-directory: Cisco/device-drivers/netconf-python
+    repository: netconf-python
     filename: main.py
     decorator: netconf-set-config-input
     runtime:
