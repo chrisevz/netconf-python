@@ -11,13 +11,20 @@ Requires on the device:
     (optional) candidate-datastore support   ← enables candidate + commit
 
 Actions: netconf-is-alive, netconf-run-command, netconf-get-config, netconf-get-config-clis,
-netconf-send-command, netconf-commit, netconf-discard, netconf-reboot
+netconf-preview-config, netconf-send-command, netconf-commit, netconf-discard, netconf-reboot
 
 netconf-send-command's do_commit=false stages a change into candidate (validated, not
 committed, not discarded) and returns — leaving it for a caller to render/diff separately
 (e.g. via netconf-get-config-clis with datastore=candidate) and then finish with a later
 netconf-commit or netconf-discard call. This driver does no rendering-format or diffing
-itself; that's left to the calling platform/workflow.
+itself for that path; that's left to the calling platform/workflow.
+
+netconf-preview-config (IOS XE only) is the single-shot alternative: it stages, diffs
+running vs candidate via difflib, and discards, all within one session, leaving zero
+state on the device. Refuses to touch a dirty candidate (uncommitted work from another
+session) unless force_discard is set. netconf-send-command's expect_running_hash lets a
+caller guard against running config having drifted since a netconf-preview-config call
+captured its hash.
 
 Platform is resolved from (in order): --platform CLI flag, inventory attribute
 "platform" (e.g. "IOS XE" / "NX-OS"), default "ios-xe" for backward compatibility.
@@ -35,6 +42,8 @@ CLI flags for connection params override stdin values — useful for local testi
 """
 
 import argparse
+import difflib
+import hashlib
 import json
 import os
 import sys
@@ -435,6 +444,162 @@ def _acquire_candidate_lock(m, timeout: int, poll_interval: float) -> float:
             time.sleep(poll_interval)
 
 
+def _normalize_cli(text: str) -> str:
+    """rstrip each line, drop blank lines, join with \\n. Used for both the
+    dirty-candidate check and the diff inputs in netconf-preview-config, so
+    trailing whitespace / blank-line noise from the renderer doesn't produce
+    false differences."""
+    if not text:
+        return ""
+    lines = (line.rstrip() for line in text.splitlines())
+    return "\n".join(line for line in lines if line)
+
+
+def _cli_hash(text: str) -> str:
+    """sha256 of normalized CLI text, first 16 hex chars — short fingerprint
+    used for netconf-preview-config's running_hash and netconf-send-command's
+    expect_running_hash drift guard."""
+    return hashlib.sha256(_normalize_cli(text).encode("utf-8")).hexdigest()[:16]
+
+
+def preview_config(conn, args) -> dict:
+    """Stage a proposed change, diff it against running, and leave zero state on
+    the device — all in one session. IOS XE only (get-modelled-config-clis has
+    no NX-OS equivalent).
+
+    Sequence: lock candidate -> render running -> render candidate (dirty check:
+    if it already differs from running, another session has uncommitted work
+    there; refuse unless force_discard) -> discard_changes -> edit_config with
+    the caller's payload -> validate (captured, not raised) -> re-render
+    candidate -> diff running vs candidate -> discard_changes + unlock in a
+    finally, discarding only if we actually edited.
+
+    Never commits (committed is always False in the result) and never leaves
+    the candidate populated or locked, on any exit path.
+    """
+    device_name = conn.get("device_name") or conn["host"]
+    if conn["platform"] != _PLATFORM_IOSXE:
+        return {
+            "success": False,
+            "host": conn["host"],
+            "device_name": device_name,
+            "error": "netconf-preview-config is IOS XE only — not available on NX-OS.",
+            "error_type": "NotImplementedError",
+        }
+
+    raw_config_xml = getattr(args, "config_xml", None)
+    if not args.command and not raw_config_xml:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": "command or config_xml is required for action=netconf-preview-config"}
+    if raw_config_xml:
+        config_xml = raw_config_xml
+    else:
+        try:
+            config_xml = _build_config_xml(conn["platform"], args.command)
+        except NotImplementedError as e:
+            return {"success": False, "host": conn["host"], "device_name": device_name,
+                    "error": str(e), "error_type": "NotImplementedError"}
+
+    force_discard = getattr(args, "force_discard", False)
+    include_diff = getattr(args, "diff", True)
+
+    try:
+        with _session(conn) as m:
+            if not _has_candidate(m):
+                return {"success": False, "host": conn["host"], "device_name": device_name,
+                        "error": "device has no candidate datastore — netconf-preview-config requires it"}
+
+            lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
+            edited = False
+            try:
+                running_clis, running_err = _get_modelled_config_clis(m, "running")
+                if running_clis is None:
+                    return {
+                        "success": False, "host": conn["host"], "device_name": device_name,
+                        "commands": args.command, "lock_wait_seconds": round(lock_wait, 2),
+                        "error": running_err or "CLI render of running returned no result",
+                        "error_type": "RPCError", "committed": False,
+                    }
+
+                candidate_before, candidate_before_err = _get_modelled_config_clis(m, "candidate")
+                if candidate_before is None:
+                    return {
+                        "success": False, "host": conn["host"], "device_name": device_name,
+                        "commands": args.command, "lock_wait_seconds": round(lock_wait, 2),
+                        "error": candidate_before_err or "CLI render of candidate returned no result",
+                        "error_type": "RPCError", "committed": False,
+                    }
+
+                running_norm = _normalize_cli(running_clis)
+                candidate_before_norm = _normalize_cli(candidate_before)
+                if running_norm != candidate_before_norm and not force_discard:
+                    return {
+                        "success": False, "host": conn["host"], "device_name": device_name,
+                        "commands": args.command, "lock_wait_seconds": round(lock_wait, 2),
+                        "error": "candidate datastore is dirty (differs from running) — another "
+                                 "session may have uncommitted work staged there. Pass "
+                                 "force_discard=true to discard it and proceed.",
+                        "error_type": "DirtyCandidate", "committed": False,
+                    }
+
+                # Clear candidate before staging our own edit — a no-op if it
+                # already matched running; discards another session's stray
+                # work if force_discard was needed to get past the check above.
+                m.discard_changes()
+
+                m.edit_config(target="candidate", config=config_xml)
+                edited = True
+
+                try:
+                    m.validate(source="candidate")
+                    valid = True
+                    validate_result = "valid"
+                except RPCError as e:
+                    valid = False
+                    validate_result = str(e)
+
+                candidate_after, candidate_after_err = _get_modelled_config_clis(m, "candidate")
+                candidate_after_norm = _normalize_cli(candidate_after)
+
+                diff_text = None
+                if include_diff:
+                    diff_text = "\n".join(difflib.unified_diff(
+                        running_norm.splitlines(), candidate_after_norm.splitlines(),
+                        fromfile="running", tofile="candidate", lineterm="",
+                    ))
+
+                return {
+                    "success": True,
+                    "host": conn["host"],
+                    "device_name": device_name,
+                    "commands": args.command,
+                    "lock_wait_seconds": round(lock_wait, 2),
+                    "valid": valid,
+                    "validate": validate_result,
+                    "diff": diff_text,
+                    "has_changes": running_norm != candidate_after_norm,
+                    "candidate_config": candidate_after or "",
+                    "running_config": running_clis or "",
+                    "running_hash": _cli_hash(running_clis),
+                    "warning": running_err or candidate_before_err or candidate_after_err,
+                    "committed": False,
+                }
+            finally:
+                try:
+                    if edited:
+                        m.discard_changes()
+                except Exception:
+                    pass
+                try:
+                    m.unlock(target="candidate")
+                except Exception:
+                    pass
+    except Exception as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "commands": args.command, "error": str(e), "error_type": type(e).__name__,
+                "committed": False}
+
+
 def send_command(conn, args) -> dict:
     device_name = conn.get("device_name") or conn["host"]
     raw_config_xml = getattr(args, "config_xml", None)
@@ -445,6 +610,7 @@ def send_command(conn, args) -> dict:
     do_commit = getattr(args, "do_commit", True)
     confirmed = getattr(args, "confirmed", False)
     confirm_timeout = getattr(args, "confirm_timeout", None) or 10
+    expect_running_hash = getattr(args, "expect_running_hash", None)
 
     if raw_config_xml:
         # Caller supplies an already-valid NETCONF <config> payload (e.g. generated
@@ -464,6 +630,32 @@ def send_command(conn, args) -> dict:
 
     try:
         with _session(conn) as m:
+            if expect_running_hash:
+                # Drift guard: caller captured running_hash from an earlier
+                # netconf-preview-config call and wants to be sure nothing else
+                # changed running config in between. Re-render+hash before
+                # touching candidate at all, and refuse to apply on a mismatch.
+                if conn["platform"] != _PLATFORM_IOSXE:
+                    return {
+                        "success": False,
+                        "host": conn["host"],
+                        "device_name": device_name,
+                        "error": "expect_running_hash drift guard is IOS XE only — not available on NX-OS.",
+                        "error_type": "NotImplementedError",
+                    }
+                current_running, _current_running_err = _get_modelled_config_clis(m, "running")
+                actual_hash = _cli_hash(current_running or "")
+                if actual_hash != expect_running_hash:
+                    return {
+                        "success": False,
+                        "host": conn["host"],
+                        "device_name": device_name,
+                        "error": "running config has drifted since expect_running_hash was captured — refusing to apply",
+                        "error_type": "ConfigDrift",
+                        "expected_running_hash": expect_running_hash,
+                        "actual_running_hash": actual_hash,
+                    }
+
             use_candidate = _has_candidate(m)
 
             if use_candidate:
@@ -686,6 +878,7 @@ _DISPATCH = {
     "netconf-run-command": run_command,
     "netconf-get-config": get_config,
     "netconf-get-config-clis": get_config_clis,
+    "netconf-preview-config": preview_config,
     "netconf-send-command": send_command,
     "netconf-set-config": send_command,
     "netconf-commit": commit_only,
@@ -803,8 +996,20 @@ def build_parser() -> argparse.ArgumentParser:
                              "committing — for a workflow that renders/diffs candidate separately "
                              "(e.g. via netconf-get-config-clis) before a later netconf-commit or "
                              "netconf-discard call.")
+    parser.add_argument("--diff", nargs="?", const=True, default=None,
+                        help="Default true. netconf-preview-config only — include a unified diff "
+                             "(running vs candidate) in the result.")
+    parser.add_argument("--force_discard", "--force-discard", dest="force_discard", nargs="?",
+                        const=True, default=None,
+                        help="Default false. netconf-preview-config only — if the candidate "
+                             "datastore is dirty (differs from running), discard it and proceed "
+                             "instead of returning error_type=DirtyCandidate.")
     parser.add_argument("--confirmed", nargs="?", const=True, default=None)
     parser.add_argument("--confirm_timeout", "--confirm-timeout", dest="confirm_timeout", type=_optional_int, default=None)
+    parser.add_argument("--expect_running_hash", "--expect-running-hash", dest="expect_running_hash", default=None,
+                        help="netconf-send-command only — optional drift guard. If set, running "
+                             "config is re-rendered and hashed before applying; a mismatch returns "
+                             "error_type=ConfigDrift instead of applying. IOS XE only.")
     parser.add_argument("--config", default=None)
     parser.add_argument("--config_content", "--config-content", dest="config_content", default=None)
     parser.add_argument("--config_xml", "--config-xml", dest="config_xml", default=None,
@@ -822,7 +1027,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _normalize_args(args):
     for attr in ("source", "filter", "at", "message", "host", "user", "password", "platform",
-                 "config", "config_content", "config_xml", "commands", "options"):
+                 "config", "config_content", "config_xml", "commands", "options",
+                 "expect_running_hash"):
         if getattr(args, attr, None) == "":
             setattr(args, attr, None)
 
@@ -838,7 +1044,7 @@ def _normalize_args(args):
         if val is not None and ("\n" in val or "\r" in val):
             raise SystemExit(f"--{attr} must not contain embedded newlines")
 
-    for attr in ("dry_run", "confirmed"):
+    for attr in ("dry_run", "confirmed", "force_discard"):
         val = getattr(args, attr, None)
         if val is None or val == "":
             setattr(args, attr, False)
@@ -853,6 +1059,15 @@ def _normalize_args(args):
         args.do_commit = True
     elif isinstance(val, str):
         args.do_commit = val.lower() in ("true", "1", "yes")
+
+    # diff also defaults to True (netconf-preview-config includes the unified
+    # diff unless explicitly turned off) — same opposite-polarity reasoning as
+    # do_commit, kept as its own block rather than folded into that one.
+    val = getattr(args, "diff", None)
+    if val is None or val == "":
+        args.diff = True
+    elif isinstance(val, str):
+        args.diff = val.lower() in ("true", "1", "yes")
 
     if args.commands and not args.command:
         raw = args.commands
