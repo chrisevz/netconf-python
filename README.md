@@ -22,7 +22,9 @@ Resolved in this order:
 | `netconf-run-command` | Execute exec-mode CLI commands | IOS XE: `cisco-ia` exec RPC. NX-OS: ncclient's native `exec_command()` (legacy `nxos:1.0` namespace) — **not universally supported**; devices that only expose the native `Cisco-NX-OS-device` YANG model (confirmed on NX-OS 9.2(4)) will fail this cleanly with a message pointing at structured `<get>` instead. |
 | `netconf-get-config` | Retrieve running or candidate configuration | Fully generic — `xml` format works identically on both platforms with zero platform-specific code. `text`/`set` formats go through `netconf-run-command`'s exec path (IOS XE only, currently). |
 | `netconf-get-config-clis` | Render running or candidate as CLI text | IOS XE only. Uses `get-modelled-config-clis` (`Cisco-IOS-XE-cli-rpc`) — the device's own modelled-config-to-CLI renderer, not a screen-scrape. This is the mechanism behind an operator CLI preview; unlike `netconf-get-config`'s `text`/`set` formats it can render `candidate`, not just `running`. See "CLI preview" section below. |
-| `netconf-send-command` | Apply config and commit | See below — two input modes. |
+| `netconf-send-command` | Apply config and commit (or just stage it) | See below — two input modes, plus `do_commit=false` to stage without committing. |
+| `netconf-commit` | Commit whatever is already staged in candidate | Pairs with a prior `do_commit=false` call. Takes its own lock. |
+| `netconf-discard` | Discard whatever is staged in candidate | Reject path for a prior `do_commit=false` call. |
 | `netconf-reboot` | Schedule a reload | Goes through the same exec-command path as `netconf-run-command`; same NX-OS caveat applies. NX-OS `reload` interactive-confirmation behavior via `exec_command()` is unvalidated. |
 
 ## netconf-send-command: two input modes
@@ -55,6 +57,34 @@ actual confirming commit (which would need either a same-session call or `persis
 `persist_id` to survive across sessions). This needs to be wired up before `confirmed=True`
 is relied on for real rollback protection on *any* platform, IOS XE included.
 
+## Stage → preview → commit-or-discard workflow
+
+**This driver intentionally does no rendering-format or diffing itself.** That's left to
+whatever platform/workflow is calling it (e.g. rendering nicely and diffing on the P6
+side). The driver just exposes the three primitives needed to build that workflow:
+
+1. **Stage:** call `netconf-send-command` (or `-config` / `-config-xml`) with
+   `do_commit=false`. This locks candidate, applies the config, validates it, and
+   returns — **without** committing and **without** discarding. The change sits in
+   candidate on the device.
+2. **Render/diff:** call `netconf-get-config-clis` twice — once with
+   `datastore=running`, once with `datastore=candidate` — as separate calls. Diff and
+   present them however the calling platform wants.
+3. **Finish:** once approved, call `netconf-commit`. Once rejected, call
+   `netconf-discard`. Both take their own lock — they don't assume anything about
+   which session staged the candidate.
+
+The candidate datastore is device-side state, not tied to the NETCONF session that
+wrote it, so steps 1–3 are expected to work as separate calls (separate sessions)
+minutes apart. That expectation follows from how NETCONF's candidate datastore is
+specified (RFC 6241) but **has not yet been validated live end-to-end** on IOS XE
+17.15 — the cheap test is: stage a trivial change, wait, then run
+`netconf-get-config-clis` with `datastore=candidate` from a fresh call and confirm the
+change is still there.
+
+`do_commit=false` requires the device to support the candidate datastore — same
+requirement and same error as `dry_run` if it doesn't.
+
 ## CLI preview (netconf-get-config-clis)
 
 Validated live against a Catalyst C9500 (IOS XE 17.15.05): schema retrieved via
@@ -78,10 +108,11 @@ leak in, no normalization needed before diffing. Latency was ~17s for that rende
 - `Cisco-IOS-XE-cli-preview-rpc` (a different module, `candidate-preview` RPC) was
   confirmed genuinely absent on the same device (`<get-schema>` → `inconsistent value`
   RPCError) — don't build against it.
-- Whether a `candidate` staged in one NETCONF session (e.g. via `netconf-send-command`
-  with a future `do_commit=false`) survives session close so it can be rendered from a
-  *separate* session later is unvalidated on IOS XE 17.15. This matters for any workflow
-  with an operator approval gate between staging and preview/commit.
+- Whether a `candidate` staged in one NETCONF session (via `netconf-send-command` with
+  `do_commit=false`) survives session close so it can be rendered from a *separate*
+  session later is unvalidated on IOS XE 17.15 — see "Stage → preview → commit-or-discard
+  workflow" above. This matters for any workflow with an operator approval gate between
+  staging and preview/commit.
 
 ## get-config format options
 
@@ -132,6 +163,8 @@ invoked through an inventory action.
 | `netconf-send-config` | netconf-send-command | Workflow passes `config` (multi-line block) — IOS XE only |
 | `netconf-send-command` | netconf-send-command | Workflow passes `commands` (array) — IOS XE only |
 | `netconf-send-config-xml` | netconf-send-command | Workflow passes `config_xml` (raw payload) — generic, any platform |
+| `netconf-commit` | netconf-commit | Commits whatever is already staged in candidate. Optional `confirmed`, `confirm_timeout` |
+| `netconf-discard` | netconf-discard | Discards whatever is already staged in candidate. No runtime args needed |
 | `netconf-reboot` | netconf-reboot | Optional `at`, `message` |
 | `netconf-set-config` | netconf-set-config | Config Manager remediation broker entry point |
 
@@ -175,6 +208,7 @@ iagctl run service python-script netconf-reboot \
 - **Platform selector:** `platform` — from CLI flag, inventory attribute, or defaults to `ios-xe`
 - **Required for `netconf-run-command` and `netconf-send-command`:** `command` / `commands`
 - **Required for `netconf-send-config-xml`:** `config_xml`
+- **`do_commit`** (on `netconf-send-command`/`-config`/`-config-xml`): default `true`. `false` stages into candidate and returns without committing or discarding — see the stage/preview/commit-or-discard workflow above.
 - **Connection fields (`host`, `user`, `password`, etc.):** resolved from inventory by default; CLI flags only when overriding
 - **Unknown keys are rejected** by `additionalProperties: false`
 

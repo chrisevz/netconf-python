@@ -102,6 +102,11 @@ decorators:
           type: string
           enum: ["", "true", "false"]
           default: "false"
+        do_commit:
+          description: Default true. Set to false to stage into candidate and leave it there (validated, not committed, not discarded) for a separate render/diff step (e.g. netconf-get-config-clis with datastore=candidate) followed by a later netconf-commit or netconf-discard call. Empty = true.
+          type: string
+          enum: ["", "true", "false"]
+          default: "true"
         confirmed:
           description: "Use a confirmed commit. CAUTION — confirmed rollback-on-timeout was tested and found unreliable on at least one NX-OS image; do not treat this as a proven safety net without re-validating against the target platform/version."
           type: string
@@ -140,6 +145,11 @@ decorators:
           type: string
           enum: ["", "true", "false"]
           default: "false"
+        do_commit:
+          description: Default true. Set to false to stage into candidate and leave it there (validated, not committed, not discarded) for a separate render/diff step (e.g. netconf-get-config-clis with datastore=candidate) followed by a later netconf-commit or netconf-discard call. Empty = true.
+          type: string
+          enum: ["", "true", "false"]
+          default: "true"
         confirmed:
           description: "Use a confirmed commit. CAUTION — see netconf-send-config-input notes on confirmed-commit reliability."
           type: string
@@ -177,6 +187,11 @@ decorators:
           type: string
           enum: ["", "true", "false"]
           default: "false"
+        do_commit:
+          description: Default true. Set to false to stage into candidate and leave it there (validated, not committed, not discarded) for a separate render/diff step (e.g. netconf-get-config-clis with datastore=candidate) followed by a later netconf-commit or netconf-discard call. Empty = true.
+          type: string
+          enum: ["", "true", "false"]
+          default: "true"
         confirmed:
           description: "Use a confirmed commit. CAUTION — see netconf-send-config-input notes on confirmed-commit reliability."
           type: string
@@ -231,6 +246,45 @@ decorators:
           type: integer
           default: 90
       required: [config]
+      additionalProperties: false
+
+  - name: netconf-commit-input
+    schema:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      title: netconf-commit inputs
+      type: object
+      properties:
+        platform:
+          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
+          type: string
+        confirmed:
+          description: "Use a confirmed commit. CAUTION — see netconf-send-config-input notes on confirmed-commit reliability."
+          type: string
+          enum: ["", "true", "false"]
+          default: "false"
+        confirm_timeout:
+          description: Seconds before auto-rollback for confirmed commit
+          type: integer
+          default: 10
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
+      additionalProperties: false
+
+  - name: netconf-discard-input
+    schema:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      title: netconf-discard inputs
+      type: object
+      properties:
+        platform:
+          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
+          type: string
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
       additionalProperties: false
 
 services:
@@ -332,3 +386,25 @@ services:
       env:
         NETCONF_OP: netconf-set-config
     tags: [driver, iosxe, netconf, cisco, broker]
+
+  - name: netconf-commit
+    type: python-script
+    description: Cisco NETCONF (IOS XE / NX-OS) — commit whatever is already staged in the candidate datastore. Pairs with netconf-send-command's do_commit=false.
+    repository: netconf-python
+    filename: main.py
+    decorator: netconf-commit-input
+    runtime:
+      env:
+        NETCONF_OP: netconf-commit
+    tags: [driver, iosxe, nxos, netconf, cisco]
+
+  - name: netconf-discard
+    type: python-script
+    description: Cisco NETCONF (IOS XE / NX-OS) — discard whatever is staged in the candidate datastore. Pairs with netconf-send-command's do_commit=false.
+    repository: netconf-python
+    filename: main.py
+    decorator: netconf-discard-input
+    runtime:
+      env:
+        NETCONF_OP: netconf-discard
+    tags: [driver, iosxe, nxos, netconf, cisco]

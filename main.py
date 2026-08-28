@@ -11,7 +11,13 @@ Requires on the device:
     (optional) candidate-datastore support   ← enables candidate + commit
 
 Actions: netconf-is-alive, netconf-run-command, netconf-get-config, netconf-get-config-clis,
-netconf-send-command, netconf-reboot
+netconf-send-command, netconf-commit, netconf-discard, netconf-reboot
+
+netconf-send-command's do_commit=false stages a change into candidate (validated, not
+committed, not discarded) and returns — leaving it for a caller to render/diff separately
+(e.g. via netconf-get-config-clis with datastore=candidate) and then finish with a later
+netconf-commit or netconf-discard call. This driver does no rendering-format or diffing
+itself; that's left to the calling platform/workflow.
 
 Platform is resolved from (in order): --platform CLI flag, inventory attribute
 "platform" (e.g. "IOS XE" / "NX-OS"), default "ios-xe" for backward compatibility.
@@ -436,6 +442,7 @@ def send_command(conn, args) -> dict:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "error": "command or config_xml is required for action=netconf-send-command"}
     dry_run = getattr(args, "dry_run", False)
+    do_commit = getattr(args, "do_commit", True)
     confirmed = getattr(args, "confirmed", False)
     confirm_timeout = getattr(args, "confirm_timeout", None) or 10
 
@@ -478,6 +485,32 @@ def send_command(conn, args) -> dict:
                             "commands": args.command,
                             "lock_wait_seconds": round(lock_wait, 2),
                             "dry_run": True,
+                            "committed": False,
+                            "validate": validate_result,
+                        }
+
+                    if not do_commit:
+                        # Stage and leave it in candidate — no discard, no commit.
+                        # The candidate datastore is device-side state, not tied to
+                        # this NETCONF session, so it's expected to still be there
+                        # for a later, separate netconf-get-config-clis(candidate)
+                        # render or a netconf-commit/netconf-discard call. Unlock
+                        # here rather than holding it open across an operator's
+                        # review — a long-held lock would block other automation
+                        # touching this device for however long that review takes.
+                        try:
+                            m.validate(source="candidate")
+                            validate_result = "valid"
+                        except RPCError as e:
+                            validate_result = str(e)
+                        return {
+                            "success": True,
+                            "host": conn["host"],
+                            "device_name": device_name,
+                            "commands": args.command,
+                            "lock_wait_seconds": round(lock_wait, 2),
+                            "staged": True,
+                            "committed": False,
                             "validate": validate_result,
                         }
 
@@ -529,12 +562,12 @@ def send_command(conn, args) -> dict:
                         pass
             else:
                 # No candidate datastore — edit running directly (no lock, no commit)
-                if dry_run:
+                if dry_run or not do_commit:
                     return {
                         "success": False,
                         "host": conn["host"],
                         "device_name": device_name,
-                        "error": "dry_run requires candidate datastore (enable: netconf-yang feature candidate-datastore)",
+                        "error": "dry_run/do_commit=false requires candidate datastore (enable: netconf-yang feature candidate-datastore)",
                     }
                 m.edit_config(target="running", config=config_xml)
                 result = {
@@ -549,6 +582,75 @@ def send_command(conn, args) -> dict:
                     result["_changes_list"] = args._changes_list
                 return result
 
+    except Exception as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": str(e), "error_type": type(e).__name__}
+
+
+def commit_only(conn, args) -> dict:
+    """Commit whatever is already staged in the candidate datastore — the accept
+    half of a stage (netconf-send-command with do_commit=false) -> render/diff on
+    the platform -> commit-or-discard workflow. Takes its own lock; doesn't assume
+    anything about who staged the candidate or when."""
+    device_name = conn.get("device_name") or conn["host"]
+    confirmed = getattr(args, "confirmed", False)
+    confirm_timeout = getattr(args, "confirm_timeout", None) or 10
+    try:
+        with _session(conn) as m:
+            if not _has_candidate(m):
+                return {"success": False, "host": conn["host"], "device_name": device_name,
+                        "error": "device has no candidate datastore — nothing to commit"}
+            lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
+            try:
+                commit_reply = m.commit(
+                    confirmed=confirmed,
+                    timeout=str(confirm_timeout) if confirmed else None,
+                )
+                result = {
+                    "success": True,
+                    "host": conn["host"],
+                    "device_name": device_name,
+                    "lock_wait_seconds": round(lock_wait, 2),
+                    "commit": getattr(commit_reply, "xml", str(commit_reply)),
+                }
+                if confirmed:
+                    result["confirmed"] = True
+                    result["confirm_timeout_seconds"] = confirm_timeout
+                return result
+            finally:
+                try:
+                    m.unlock(target="candidate")
+                except Exception:
+                    pass
+    except Exception as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": str(e), "error_type": type(e).__name__}
+
+
+def discard(conn, args) -> dict:
+    """Discard whatever is staged in the candidate datastore — the reject half of
+    a stage (do_commit=false) -> render/diff on the platform -> commit-or-discard
+    workflow."""
+    device_name = conn.get("device_name") or conn["host"]
+    try:
+        with _session(conn) as m:
+            if not _has_candidate(m):
+                return {"success": False, "host": conn["host"], "device_name": device_name,
+                        "error": "device has no candidate datastore — nothing to discard"}
+            lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
+            try:
+                m.discard_changes()
+                return {
+                    "success": True,
+                    "host": conn["host"],
+                    "device_name": device_name,
+                    "lock_wait_seconds": round(lock_wait, 2),
+                }
+            finally:
+                try:
+                    m.unlock(target="candidate")
+                except Exception:
+                    pass
     except Exception as e:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "error": str(e), "error_type": type(e).__name__}
@@ -586,6 +688,8 @@ _DISPATCH = {
     "netconf-get-config-clis": get_config_clis,
     "netconf-send-command": send_command,
     "netconf-set-config": send_command,
+    "netconf-commit": commit_only,
+    "netconf-discard": discard,
     "netconf-reboot": reboot,
 }
 
@@ -693,6 +797,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--command", action="append", default=None)
     parser.add_argument("--commands", default=None)
     parser.add_argument("--dry_run", "--dry-run", dest="dry_run", nargs="?", const=True, default=None)
+    parser.add_argument("--do_commit", "--do-commit", dest="do_commit", nargs="?", const=True, default=None,
+                        help="Default true. Set to false to stage the change into candidate and "
+                             "leave it there (validated, not committed, not discarded) instead of "
+                             "committing — for a workflow that renders/diffs candidate separately "
+                             "(e.g. via netconf-get-config-clis) before a later netconf-commit or "
+                             "netconf-discard call.")
     parser.add_argument("--confirmed", nargs="?", const=True, default=None)
     parser.add_argument("--confirm_timeout", "--confirm-timeout", dest="confirm_timeout", type=_optional_int, default=None)
     parser.add_argument("--config", default=None)
@@ -734,6 +844,15 @@ def _normalize_args(args):
             setattr(args, attr, False)
         elif isinstance(val, str):
             setattr(args, attr, val.lower() in ("true", "1", "yes"))
+
+    # do_commit defaults to True (commit) — opposite polarity from dry_run/confirmed,
+    # which default to False. IAG5 forwards '' for an unset declared param same as
+    # everywhere else in this file.
+    val = getattr(args, "do_commit", None)
+    if val is None or val == "":
+        args.do_commit = True
+    elif isinstance(val, str):
+        args.do_commit = val.lower() in ("true", "1", "yes")
 
     if args.commands and not args.command:
         raw = args.commands
