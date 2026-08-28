@@ -122,6 +122,43 @@ decorators:
           default: 90
       additionalProperties: false
 
+  - name: netconf-preview-config-input
+    schema:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      title: netconf-preview-config inputs
+      type: object
+      properties:
+        platform:
+          description: "'IOS XE' only — this op has no NX-OS equivalent."
+          type: string
+        commands:
+          description: Array of raw CLI config commands to preview. Same as netconf-send-command's commands — provide this or config_xml, not both.
+          type: array
+          items:
+            type: string
+        config_xml:
+          description: Raw pre-built NETCONF <config> XML payload to preview, pushed as-is. Provide this or commands, not both.
+          type: string
+        force_discard:
+          description: Default false. If the candidate datastore is already dirty (differs from running — another session's uncommitted work), discard it and proceed instead of returning error_type=DirtyCandidate. Empty = false.
+          type: string
+          enum: ["", "true", "false"]
+          default: "false"
+        diff:
+          description: Default true. Include a unified diff (running vs candidate) in the result. Empty = true.
+          type: string
+          enum: ["", "true", "false"]
+          default: "true"
+        lock_timeout:
+          description: Seconds to wait for candidate datastore lock (0 = fail immediately)
+          type: integer
+          default: 30
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
+      additionalProperties: false
+
   - name: netconf-send-command-input
     schema:
       $schema: https://json-schema.org/draft/2020-12/schema
@@ -319,6 +356,17 @@ services:
     runtime:
       env:
         NETCONF_OP: netconf-get-config-clis
+    tags: [driver, iosxe, netconf, cisco, preview]
+
+  - name: netconf-preview-config
+    type: python-script
+    description: Cisco NETCONF (IOS XE only) — stage a proposed change, diff it against running via get-modelled-config-clis, then discard. Leaves zero state on the device; never commits.
+    repository: netconf-python
+    filename: main.py
+    decorator: netconf-preview-config-input
+    runtime:
+      env:
+        NETCONF_OP: netconf-preview-config
     tags: [driver, iosxe, netconf, cisco, preview]
 
   - name: netconf-get-config
