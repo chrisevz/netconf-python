@@ -475,7 +475,11 @@ def preview_config(conn, args) -> dict:
     finally, discarding only if we actually edited.
 
     Never commits (committed is always False in the result) and never leaves
-    the candidate populated or locked, on any exit path.
+    the candidate populated or locked, on any exit path. This depends on
+    `edited` being set to True immediately before the edit_config call, not
+    after — a raising edit_config (e.g. cli-config-data applying commands
+    sequentially and failing partway through) still needs the finally's
+    discard. Don't reorder it back.
     """
     device_name = conn.get("device_name") or conn["host"]
     if conn["platform"] != _PLATFORM_IOSXE:
@@ -547,8 +551,11 @@ def preview_config(conn, args) -> dict:
                 # work if force_discard was needed to get past the check above.
                 m.discard_changes()
 
-                m.edit_config(target="candidate", config=config_xml)
+                # Set before the call, not after: cli-config-data applies commands
+                # sequentially, so a raising edit_config may have partially applied.
+                # The discard in the finally is most needed on exactly that path.
                 edited = True
+                m.edit_config(target="candidate", config=config_xml)
 
                 try:
                     m.validate(source="candidate")
@@ -594,6 +601,15 @@ def preview_config(conn, args) -> dict:
                     m.unlock(target="candidate")
                 except Exception:
                     pass
+    except RPCError as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "commands": args.command, "committed": False,
+                "error": str(e), "error_type": "RPCError",
+                "rpc_tag": getattr(e, "tag", None),
+                "rpc_type": getattr(e, "type", None),
+                "rpc_severity": getattr(e, "severity", None),
+                "rpc_info": getattr(e, "info", None),
+                "rpc_path": getattr(e, "path", None)}
     except Exception as e:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "commands": args.command, "error": str(e), "error_type": type(e).__name__,
@@ -661,6 +677,13 @@ def send_command(conn, args) -> dict:
             if use_candidate:
                 lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
                 try:
+                    # IOS XE's candidate is a single global datastore, not per-session.
+                    # The lock grants exclusive write access; it does NOT guarantee an
+                    # empty candidate. Without this, edit_config stacks on top of
+                    # whatever a prior or killed session left staged, and commit
+                    # pushes all of it.
+                    m.discard_changes()
+
                     m.edit_config(target="candidate", config=config_xml)
 
                     if dry_run:
@@ -774,6 +797,14 @@ def send_command(conn, args) -> dict:
                     result["_changes_list"] = args._changes_list
                 return result
 
+    except RPCError as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": str(e), "error_type": "RPCError",
+                "rpc_tag": getattr(e, "tag", None),
+                "rpc_type": getattr(e, "type", None),
+                "rpc_severity": getattr(e, "severity", None),
+                "rpc_info": getattr(e, "info", None),
+                "rpc_path": getattr(e, "path", None)}
     except Exception as e:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "error": str(e), "error_type": type(e).__name__}
@@ -814,6 +845,14 @@ def commit_only(conn, args) -> dict:
                     m.unlock(target="candidate")
                 except Exception:
                     pass
+    except RPCError as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": str(e), "error_type": "RPCError",
+                "rpc_tag": getattr(e, "tag", None),
+                "rpc_type": getattr(e, "type", None),
+                "rpc_severity": getattr(e, "severity", None),
+                "rpc_info": getattr(e, "info", None),
+                "rpc_path": getattr(e, "path", None)}
     except Exception as e:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "error": str(e), "error_type": type(e).__name__}
@@ -843,6 +882,14 @@ def discard(conn, args) -> dict:
                     m.unlock(target="candidate")
                 except Exception:
                     pass
+    except RPCError as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": str(e), "error_type": "RPCError",
+                "rpc_tag": getattr(e, "tag", None),
+                "rpc_type": getattr(e, "type", None),
+                "rpc_severity": getattr(e, "severity", None),
+                "rpc_info": getattr(e, "info", None),
+                "rpc_path": getattr(e, "path", None)}
     except Exception as e:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "error": str(e), "error_type": type(e).__name__}
