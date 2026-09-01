@@ -467,19 +467,32 @@ def preview_config(conn, args) -> dict:
     the device — all in one session. IOS XE only (get-modelled-config-clis has
     no NX-OS equivalent).
 
-    Sequence: lock candidate -> render running -> render candidate (dirty check:
-    if it already differs from running, another session has uncommitted work
-    there; refuse unless force_discard) -> discard_changes -> edit_config with
-    the caller's payload -> validate (captured, not raised) -> re-render
-    candidate -> diff running vs candidate -> discard_changes + unlock in a
-    finally, discarding only if we actually edited.
+    Sequence: render running -> render candidate -> dirty check (if candidate
+    already differs from running, another session has uncommitted work there —
+    refuse with a dirty_diff unless force_discard, in which case discard it,
+    no lock needed) -> lock candidate -> edit_config with the caller's payload
+    -> validate (captured, not raised) -> re-render candidate -> diff running
+    vs candidate -> discard_changes + unlock in a finally, discarding only if
+    we actually edited.
+
+    The dirty check runs BEFORE the lock, not after. A dirty candidate is
+    exactly what makes lock(candidate) fail (operation-failed / "there are
+    outstanding changes to the database" — confirmed live on IOS XE 17.15), so
+    a dirty check placed after the lock is unreachable on the one input it
+    exists to handle. This ordering only works because discard-changes
+    requires no lock (RFC 6241 §8.3.4.2, also confirmed live) — that's what
+    makes a pre-lock discard possible at all.
+
+    Because of this, the DirtyCandidate and render-failure returns happen
+    before any lock is taken, so they have no lock_wait_seconds key. That's
+    expected — its absence itself signals the call never reached the lock.
 
     Never commits (committed is always False in the result) and never leaves
-    the candidate populated or locked, on any exit path. This depends on
-    `edited` being set to True immediately before the edit_config call, not
-    after — a raising edit_config (e.g. cli-config-data applying commands
-    sequentially and failing partway through) still needs the finally's
-    discard. Don't reorder it back.
+    the candidate populated or locked on any exit path reached after the lock
+    is taken. That guarantee depends on `edited` being set to True immediately
+    before the edit_config call, not after — a raising edit_config (e.g.
+    cli-config-data applying commands sequentially and failing partway
+    through) still needs the finally's discard. Don't reorder it back.
     """
     device_name = conn.get("device_name") or conn["host"]
     if conn["platform"] != _PLATFORM_IOSXE:
@@ -513,44 +526,60 @@ def preview_config(conn, args) -> dict:
                 return {"success": False, "host": conn["host"], "device_name": device_name,
                         "error": "device has no candidate datastore — netconf-preview-config requires it"}
 
-            lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
-            edited = False
-            try:
-                running_clis, running_err = _get_modelled_config_clis(m, "running")
-                if running_clis is None:
-                    return {
-                        "success": False, "host": conn["host"], "device_name": device_name,
-                        "commands": args.command, "lock_wait_seconds": round(lock_wait, 2),
-                        "error": running_err or "CLI render of running returned no result",
-                        "error_type": "RPCError", "committed": False,
-                    }
+            # Render and compare before locking. A dirty candidate is what makes
+            # lock(candidate) fail (operation-failed / "there are outstanding
+            # changes to the database"), so a dirty check placed after the lock
+            # is unreachable on exactly the input it exists to handle. Confirmed
+            # live against IOS XE 17.15.
+            running_clis, running_err = _get_modelled_config_clis(m, "running")
+            if running_clis is None:
+                return {
+                    "success": False, "host": conn["host"], "device_name": device_name,
+                    "commands": args.command,
+                    "error": running_err or "CLI render of running returned no result",
+                    "error_type": "RPCError", "committed": False,
+                }
 
-                candidate_before, candidate_before_err = _get_modelled_config_clis(m, "candidate")
-                if candidate_before is None:
-                    return {
-                        "success": False, "host": conn["host"], "device_name": device_name,
-                        "commands": args.command, "lock_wait_seconds": round(lock_wait, 2),
-                        "error": candidate_before_err or "CLI render of candidate returned no result",
-                        "error_type": "RPCError", "committed": False,
-                    }
+            candidate_before, candidate_before_err = _get_modelled_config_clis(m, "candidate")
+            if candidate_before is None:
+                return {
+                    "success": False, "host": conn["host"], "device_name": device_name,
+                    "commands": args.command,
+                    "error": candidate_before_err or "CLI render of candidate returned no result",
+                    "error_type": "RPCError", "committed": False,
+                }
 
-                running_norm = _normalize_cli(running_clis)
-                candidate_before_norm = _normalize_cli(candidate_before)
-                if running_norm != candidate_before_norm and not force_discard:
+            running_norm = _normalize_cli(running_clis)
+            candidate_before_norm = _normalize_cli(candidate_before)
+
+            if running_norm != candidate_before_norm:
+                if not force_discard:
+                    # Return the diff, not just the refusal — the caller needs to
+                    # see what they'd be destroying before deciding. This may be
+                    # real pending provisioning from another session, not noise.
+                    dirty_diff = "\n".join(difflib.unified_diff(
+                        running_norm.splitlines(), candidate_before_norm.splitlines(),
+                        fromfile="running", tofile="candidate", lineterm="",
+                    ))
                     return {
                         "success": False, "host": conn["host"], "device_name": device_name,
-                        "commands": args.command, "lock_wait_seconds": round(lock_wait, 2),
+                        "commands": args.command,
                         "error": "candidate datastore is dirty (differs from running) — another "
                                  "session may have uncommitted work staged there. Pass "
                                  "force_discard=true to discard it and proceed.",
-                        "error_type": "DirtyCandidate", "committed": False,
+                        "error_type": "DirtyCandidate",
+                        "dirty_diff": dirty_diff,
+                        "committed": False,
                     }
-
-                # Clear candidate before staging our own edit — a no-op if it
-                # already matched running; discards another session's stray
-                # work if force_discard was needed to get past the check above.
+                # force_discard=true: clear it now, before locking — discard-changes
+                # requires no lock (RFC 6241 §8.3.4.2). Must stay gated on
+                # force_discard, never unconditional, or preview silently destroys
+                # another session's pending work.
                 m.discard_changes()
 
+            lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
+            edited = False
+            try:
                 # Set before the call, not after: cli-config-data applies commands
                 # sequentially, so a raising edit_config may have partially applied.
                 # The discard in the finally is most needed on exactly that path.
