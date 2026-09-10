@@ -1,2 +1,7 @@
-ncclient>=0.6.13
-lxml>=4.9.0
+# Pinned exact versions, not floors — an unbounded floor (ncclient>=0.6.13,
+# lxml>=4.9.0) invites unreviewed behavior changes landing silently in
+# production the next time IAG5 pulls a fresh environment. TODO: validate
+# these exact pins against the actual gateway5 Python environment before
+# relying on them — not verified against this fleet's gateway hosts.
+ncclient==0.6.19
+lxml==5.2.2

@@ -1,9 +1,13 @@
 ---
 repositories:
   - name: netconf-python
-    description: Cisco NETCONF Python driver (IOS XE / NX-OS)
+    description: Cisco IOS XE NETCONF Python driver — single use case (preview + push via config_xml)
     url: https://github.com/chrisevz/netconf-python.git
-    reference: main
+    # Pinned, not "main" — a moving branch reference means every merge to
+    # main is an unreviewed production deploy (IAG5 pulls the repo fresh on
+    # every service execution). Landing a driver change is now a deliberate
+    # two-step: merge, then move this pin.
+    reference: v1.0.0
 
 decorators:
   - name: netconf-common-input
@@ -12,33 +16,11 @@ decorators:
       title: netconf common inputs
       type: object
       properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
-          type: string
         timeout:
           description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
           type: integer
           default: 90
       additionalProperties: true
-
-  - name: netconf-run-command-input
-    schema:
-      $schema: https://json-schema.org/draft/2020-12/schema
-      title: netconf-run-command inputs
-      type: object
-      properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
-          type: string
-        command:
-          description: Exec-mode CLI command to run (e.g. "show version"). NX-OS support is device-dependent — devices exposing only the native Cisco-NX-OS-device YANG model do not support this.
-          type: string
-        timeout:
-          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
-          type: integer
-          default: 90
-      required: [command]
-      additionalProperties: false
 
   - name: netconf-get-config-clis-input
     schema:
@@ -46,15 +28,16 @@ decorators:
       title: netconf-get-config-clis inputs
       type: object
       properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. NX-OS returns a clean not-implemented error — this op is IOS XE only (get-modelled-config-clis has no NX-OS equivalent)."
-          type: string
         datastore:
           description: Datastore to render as CLI text via get-modelled-config-clis (running or candidate). Empty = running.
           type: string
           enum: ["", running, candidate]
         timeout:
-          description: Seconds to wait for the NETCONF connection/RPC reply. A full running-config render was measured at ~17s on a live device; default is generous to leave margin for larger configs.
+          description: >-
+            Seconds to wait for the NETCONF connection/RPC reply. A full running-config
+            render was measured at ~17s on a CSR1000v lab device — not the same platform
+            family as this fleet (Catalyst access/core). Realistic render time on a CAT
+            9500 core config is unverified; default is generous to leave margin.
           type: integer
           default: 90
       additionalProperties: false
@@ -65,57 +48,13 @@ decorators:
       title: netconf-get-config inputs
       type: object
       properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
-          type: string
         source:
           description: Datastore to read from (running or candidate). Empty = running.
           type: string
           enum: ["", running, candidate]
         filter:
-          description: Optional XML subtree filter (xml format only)
+          description: Optional XML subtree filter.
           type: string
-        timeout:
-          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
-          type: integer
-          default: 90
-      additionalProperties: false
-
-  - name: netconf-send-config-input
-    schema:
-      $schema: https://json-schema.org/draft/2020-12/schema
-      title: netconf-send-config inputs
-      type: object
-      properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
-          type: string
-        config:
-          description: Multi-line IOS XE CLI config block to apply (e.g. "interface Gi1\n description test"). IOS XE only — raises a clean error on NX-OS.
-          type: string
-        lock_timeout:
-          description: Seconds to wait for candidate datastore lock before failing (0 = fail immediately; ignored when device has no candidate)
-          type: integer
-          default: 30
-        dry_run:
-          description: Validate config against candidate datastore without committing (requires candidate datastore capability). Empty = false.
-          type: string
-          enum: ["", "true", "false"]
-          default: "false"
-        do_commit:
-          description: Default true. Set to false to stage into candidate and leave it there (validated, not committed, not discarded) for a separate render/diff step (e.g. netconf-get-config-clis with datastore=candidate) followed by a later netconf-commit or netconf-discard call. Empty = true.
-          type: string
-          enum: ["", "true", "false"]
-          default: "true"
-        confirmed:
-          description: "Use a confirmed commit. CAUTION — confirmed rollback-on-timeout was tested and found unreliable on at least one NX-OS image; do not treat this as a proven safety net without re-validating against the target platform/version."
-          type: string
-          enum: ["", "true", "false"]
-          default: "false"
-        confirm_timeout:
-          description: Seconds before auto-rollback for a confirmed commit (NETCONF confirm-timeout is defined in seconds, not minutes)
-          type: integer
-          default: 10
         timeout:
           description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
           type: integer
@@ -128,16 +67,8 @@ decorators:
       title: netconf-preview-config inputs
       type: object
       properties:
-        platform:
-          description: "'IOS XE' only — this op has no NX-OS equivalent."
-          type: string
-        commands:
-          description: Array of raw CLI config commands to preview. Same as netconf-send-command's commands — provide this or config_xml, not both.
-          type: array
-          items:
-            type: string
         config_xml:
-          description: Raw pre-built NETCONF <config> XML payload to preview, pushed as-is. Provide this or commands, not both.
+          description: Raw pre-built NETCONF <config> XML payload to preview, pushed as-is into candidate then discarded.
           type: string
         force_discard:
           description: Default false. If the candidate datastore is already dirty (differs from running — another session's uncommitted work), discard it and proceed instead of returning error_type=DirtyCandidate. Empty = false.
@@ -157,50 +88,7 @@ decorators:
           description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
           type: integer
           default: 90
-      additionalProperties: false
-
-  - name: netconf-send-command-input
-    schema:
-      $schema: https://json-schema.org/draft/2020-12/schema
-      title: netconf-send-command inputs
-      type: object
-      properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
-          type: string
-        commands:
-          description: Array of raw CLI config commands to apply. IOS XE only (cli-config-data) — raises a clean error on NX-OS. Use netconf-send-config-xml for NX-OS.
-          type: array
-          items:
-            type: string
-        lock_timeout:
-          description: Seconds to wait for candidate datastore lock (0 = fail immediately)
-          type: integer
-          default: 30
-        dry_run:
-          description: Validate without committing (requires candidate datastore). Empty = false.
-          type: string
-          enum: ["", "true", "false"]
-          default: "false"
-        do_commit:
-          description: Default true. Set to false to stage into candidate and leave it there (validated, not committed, not discarded) for a separate render/diff step (e.g. netconf-get-config-clis with datastore=candidate) followed by a later netconf-commit or netconf-discard call. Empty = true.
-          type: string
-          enum: ["", "true", "false"]
-          default: "true"
-        confirmed:
-          description: "Use a confirmed commit. CAUTION — see netconf-send-config-input notes on confirmed-commit reliability."
-          type: string
-          enum: ["", "true", "false"]
-          default: "false"
-        confirm_timeout:
-          description: Seconds before auto-rollback for confirmed commit
-          type: integer
-          default: 10
-        timeout:
-          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
-          type: integer
-          default: 90
-      required: [commands]
+      required: [config_xml]
       additionalProperties: false
 
   - name: netconf-send-config-xml-input
@@ -209,104 +97,26 @@ decorators:
       title: netconf-send-config-xml inputs
       type: object
       properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
-          type: string
         config_xml:
-          description: A complete, pre-built NETCONF <config> XML payload, valid for the target device's actual YANG model. Pushed as-is via edit-config — no CLI-to-XML conversion. This is the generic, platform-agnostic path (works on IOS XE and NX-OS alike, as long as the XML is correct for that device).
+          description: A complete, pre-built NETCONF <config> XML payload, valid for the target device's YANG model. Pushed as-is via edit-config, then committed.
+          type: string
+        expect_running_hash:
+          description: >-
+            Optional drift guard. Pass the running_hash returned by a prior
+            netconf-preview-config call — if running config has changed since
+            that hash was captured, the push is refused with
+            error_type=ConfigDrift instead of applying an approved diff to
+            config that has since moved.
           type: string
         lock_timeout:
           description: Seconds to wait for candidate datastore lock (0 = fail immediately)
           type: integer
           default: 30
-        dry_run:
-          description: Validate without committing (requires candidate datastore). Empty = false.
-          type: string
-          enum: ["", "true", "false"]
-          default: "false"
-        do_commit:
-          description: Default true. Set to false to stage into candidate and leave it there (validated, not committed, not discarded) for a separate render/diff step (e.g. netconf-get-config-clis with datastore=candidate) followed by a later netconf-commit or netconf-discard call. Empty = true.
-          type: string
-          enum: ["", "true", "false"]
-          default: "true"
-        confirmed:
-          description: "Use a confirmed commit. CAUTION — see netconf-send-config-input notes on confirmed-commit reliability."
-          type: string
-          enum: ["", "true", "false"]
-          default: "false"
-        confirm_timeout:
-          description: Seconds before auto-rollback for confirmed commit
-          type: integer
-          default: 10
         timeout:
           description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
           type: integer
           default: 90
       required: [config_xml]
-      additionalProperties: false
-
-  - name: netconf-reboot-input
-    schema:
-      $schema: https://json-schema.org/draft/2020-12/schema
-      title: netconf-reboot inputs
-      type: object
-      properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
-          type: string
-        at:
-          description: Minutes from now to reload (e.g. "5" for reload in 5 minutes; omit for immediate)
-          type: string
-        message:
-          description: Optional reason string logged with the reload
-          type: string
-        timeout:
-          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
-          type: integer
-          default: 90
-      additionalProperties: false
-
-  - name: netconf-set-config-input
-    schema:
-      $schema: https://json-schema.org/draft/2020-12/schema
-      title: netconf-set-config inputs
-      type: object
-      properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
-          type: string
-        config:
-          description: JSON-encoded Config Manager changes array [{parents, old, new}]
-          type: string
-        timeout:
-          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
-          type: integer
-          default: 90
-      required: [config]
-      additionalProperties: false
-
-  - name: netconf-commit-input
-    schema:
-      $schema: https://json-schema.org/draft/2020-12/schema
-      title: netconf-commit inputs
-      type: object
-      properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
-          type: string
-        confirmed:
-          description: "Use a confirmed commit. CAUTION — see netconf-send-config-input notes on confirmed-commit reliability."
-          type: string
-          enum: ["", "true", "false"]
-          default: "false"
-        confirm_timeout:
-          description: Seconds before auto-rollback for confirmed commit
-          type: integer
-          default: 10
-        timeout:
-          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
-          type: integer
-          default: 90
       additionalProperties: false
 
   - name: netconf-discard-input
@@ -315,9 +125,6 @@ decorators:
       title: netconf-discard inputs
       type: object
       properties:
-        platform:
-          description: "'IOS XE' or 'NX-OS'. Defaults to the device's inventory attribute, then 'IOS XE'."
-          type: string
         timeout:
           description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
           type: integer
@@ -327,29 +134,18 @@ decorators:
 services:
   - name: netconf-is-alive
     type: python-script
-    description: Cisco NETCONF (IOS XE / NX-OS) — verify reachability via NETCONF session
+    description: Cisco IOS XE NETCONF — verify reachability via NETCONF session
     repository: netconf-python
     filename: main.py
     decorator: netconf-common-input
     runtime:
       env:
         NETCONF_OP: netconf-is-alive
-    tags: [driver, iosxe, nxos, netconf, cisco]
-
-  - name: netconf-run-command
-    type: python-script
-    description: Cisco NETCONF (IOS XE / NX-OS) — execute exec-mode CLI commands
-    repository: netconf-python
-    filename: main.py
-    decorator: netconf-run-command-input
-    runtime:
-      env:
-        NETCONF_OP: netconf-run-command
-    tags: [driver, iosxe, nxos, netconf, cisco]
+    tags: [driver, iosxe, netconf, cisco]
 
   - name: netconf-get-config-clis
     type: python-script
-    description: Cisco NETCONF (IOS XE only) — render running or candidate as CLI text via get-modelled-config-clis. This is the mechanism behind the operator CLI preview.
+    description: Cisco IOS XE NETCONF — render running or candidate as CLI text via get-modelled-config-clis. This is the device-rendered mechanism behind netconf-preview-config's preview_mode="device-rendered" outcome.
     repository: netconf-python
     filename: main.py
     decorator: netconf-get-config-clis-input
@@ -360,7 +156,16 @@ services:
 
   - name: netconf-preview-config
     type: python-script
-    description: Cisco NETCONF (IOS XE only) — stage a proposed change, diff it against running via get-modelled-config-clis, then discard. Leaves zero state on the device; never commits.
+    description: >-
+      Cisco IOS XE NETCONF — stage a proposed config_xml change into candidate,
+      diff it against running, then discard. Leaves zero state on the device;
+      never commits. The result always includes preview_mode, telling the
+      caller which rendering produced the diff: "device-rendered" (the
+      device's own CLI render via get-modelled-config-clis, expected on
+      17.15.5-class images) or "xml-diff" (a structural get-config XML diff,
+      the fallback used when get-modelled-config-clis is unsupported —
+      expected on 17.12.4). preview_mode is never absent or guessed; an
+      operator approving a change needs to know which one they're looking at.
     repository: netconf-python
     filename: main.py
     decorator: netconf-preview-config-input
@@ -371,88 +176,39 @@ services:
 
   - name: netconf-get-config
     type: python-script
-    description: Cisco NETCONF (IOS XE / NX-OS) — retrieve running or candidate configuration
+    description: Cisco IOS XE NETCONF — retrieve running or candidate configuration as XML
     repository: netconf-python
     filename: main.py
     decorator: netconf-get-config-input
     runtime:
       env:
         NETCONF_OP: netconf-get-config
-    tags: [driver, iosxe, nxos, netconf, cisco]
-
-  - name: netconf-send-config
-    type: python-script
-    description: Cisco NETCONF — apply multi-line CLI config block via cli-config-data (IOS XE only)
-    repository: netconf-python
-    filename: main.py
-    decorator: netconf-send-config-input
-    runtime:
-      env:
-        NETCONF_OP: netconf-send-command
-    tags: [driver, iosxe, netconf, cisco]
-
-  - name: netconf-send-command
-    type: python-script
-    description: Cisco NETCONF — apply an array of raw CLI commands via cli-config-data (IOS XE only)
-    repository: netconf-python
-    filename: main.py
-    decorator: netconf-send-command-input
-    runtime:
-      env:
-        NETCONF_OP: netconf-send-command
     tags: [driver, iosxe, netconf, cisco]
 
   - name: netconf-send-config-xml
     type: python-script
-    description: Cisco NETCONF (IOS XE / NX-OS) — push a pre-built NETCONF <config> XML payload as-is via candidate/commit. The generic, platform-agnostic config-push path.
+    description: >-
+      Cisco IOS XE NETCONF — push a pre-built NETCONF <config> XML payload
+      as-is via candidate/commit. This is the only config-push path in this
+      driver. Pair with netconf-preview-config: preview first to get an
+      approved diff and a running_hash, then push here with
+      expect_running_hash set to that value so a push is refused if running
+      config drifted in between.
     repository: netconf-python
     filename: main.py
     decorator: netconf-send-config-xml-input
     runtime:
       env:
         NETCONF_OP: netconf-send-command
-    tags: [driver, iosxe, nxos, netconf, cisco]
-
-  - name: netconf-reboot
-    type: python-script
-    description: Cisco NETCONF (IOS XE / NX-OS) — schedule device reload via exec RPC
-    repository: netconf-python
-    filename: main.py
-    decorator: netconf-reboot-input
-    runtime:
-      env:
-        NETCONF_OP: netconf-reboot
-    tags: [driver, iosxe, nxos, netconf, cisco]
-
-  - name: netconf-set-config
-    type: python-script
-    description: Cisco NETCONF — Config Manager remediation via IM iag5-service action (broker entry point, IOS XE only)
-    repository: netconf-python
-    filename: main.py
-    decorator: netconf-set-config-input
-    runtime:
-      env:
-        NETCONF_OP: netconf-set-config
-    tags: [driver, iosxe, netconf, cisco, broker]
-
-  - name: netconf-commit
-    type: python-script
-    description: Cisco NETCONF (IOS XE / NX-OS) — commit whatever is already staged in the candidate datastore. Pairs with netconf-send-command's do_commit=false.
-    repository: netconf-python
-    filename: main.py
-    decorator: netconf-commit-input
-    runtime:
-      env:
-        NETCONF_OP: netconf-commit
-    tags: [driver, iosxe, nxos, netconf, cisco]
+    tags: [driver, iosxe, netconf, cisco]
 
   - name: netconf-discard
     type: python-script
-    description: Cisco NETCONF (IOS XE / NX-OS) — discard whatever is staged in the candidate datastore. Pairs with netconf-send-command's do_commit=false.
+    description: Cisco IOS XE NETCONF — discard whatever is staged in the candidate datastore (e.g. to clear a dirty candidate flagged by netconf-preview-config). Takes its own lock; does not assume anything about how the candidate became dirty.
     repository: netconf-python
     filename: main.py
     decorator: netconf-discard-input
     runtime:
       env:
         NETCONF_OP: netconf-discard
-    tags: [driver, iosxe, nxos, netconf, cisco]
+    tags: [driver, iosxe, netconf, cisco]
