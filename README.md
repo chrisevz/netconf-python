@@ -187,7 +187,8 @@ Flagged for production review, not addressed in this pass.
   iagctl delete service python-script <name>
   ```
   Check Platform for workflow bindings to a removed service name before deleting it.
-- **The repository reference is pinned** (`reference: v1.0.0` in `import.yaml`, not
-  `main`) — a moving branch reference would make every merge to `main` an unreviewed
-  production behavior change. Landing a driver change is a deliberate two-step: merge,
-  then move the pin.
+- **This repo tracks `main`** (`reference: main` in `import.yaml`) — intentional here,
+  since this repo is for testing and every push should be immediately reflected on the
+  next service run. The production driver will live on a separate repo; pin *that* one's
+  reference to a tag/SHA before it's used against a live customer environment, since a
+  moving branch reference there would make every merge an unreviewed production deploy.

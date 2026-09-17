@@ -3,11 +3,12 @@ repositories:
   - name: netconf-python
     description: Cisco IOS XE NETCONF Python driver — single use case (preview + push via config_xml)
     url: https://github.com/chrisevz/netconf-python.git
-    # Pinned, not "main" — a moving branch reference means every merge to
-    # main is an unreviewed production deploy (IAG5 pulls the repo fresh on
-    # every service execution). Landing a driver change is now a deliberate
-    # two-step: merge, then move this pin.
-    reference: v1.0.0
+    # This repo is for testing — the production driver will live on a
+    # separate repo, which is where pinning the reference actually matters
+    # (IAG5 pulls the repo fresh on every service execution, so an
+    # unpinned "main" there would mean every merge is an unreviewed prod
+    # deploy). Tracking main here is intentional for fast iteration.
+    reference: main
 
 decorators:
   - name: netconf-common-input
