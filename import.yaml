@@ -213,3 +213,18 @@ services:
       env:
         NETCONF_OP: netconf-discard
     tags: [driver, iosxe, netconf, cisco]
+
+  - name: netconf-save-config
+    type: python-script
+    description: >-
+      Cisco IOS XE NETCONF — copy running-config to startup-config (write
+      memory) so a committed change survives a reload. Tries cisco-ia
+      save-config, then Cisco-IOS-XE-rpc copy; reports which method worked.
+      Saves the whole running config, not just the last change.
+    repository: netconf-python
+    filename: main.py
+    decorator: netconf-common-input
+    runtime:
+      env:
+        NETCONF_OP: netconf-save-config
+    tags: [driver, iosxe, netconf, cisco]

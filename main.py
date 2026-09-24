@@ -12,7 +12,8 @@ netconf-python git history for the removed dual-platform version if that
 work resumes later.
 
 Actions: netconf-is-alive, netconf-get-config, netconf-get-config-clis,
-netconf-preview-config, netconf-send-command, netconf-discard.
+netconf-preview-config, netconf-send-command, netconf-discard,
+netconf-save-config.
 
 netconf-preview-config is the core feature: it stages a proposed config_xml
 change into the candidate datastore, renders/diffs it against running, and
@@ -32,6 +33,9 @@ netconf-send-command pushes the same config_xml for real: lock candidate,
 discard any stray staged content, edit, commit. Refuses to touch running
 config with expect_running_hash set if running has drifted since a prior
 netconf-preview-config call captured its hash.
+
+netconf-save-config copies running-config to startup-config (write memory)
+after a successful push, so the change survives a reload.
 
 netconf-discard clears a dirty candidate out of band (e.g. after a refused
 preview) — it does not pair with any staging mode, there isn't one.
@@ -658,6 +662,55 @@ def discard(conn, args) -> dict:
                 "error": str(e), "error_type": type(e).__name__}
 
 
+# Two ways IOS XE exposes "write memory" over NETCONF. Which one a given
+# image carries is not advertised reliably, so try them in order and report
+# which one worked. (tcs91 was reported without cisco-ia on an earlier image —
+# hence the fallback.)
+_SAVE_CONFIG_RPCS = [
+    ("cisco-ia:save-config", '<save-config xmlns="http://cisco.com/yang/cisco-ia"/>'),
+    ("Cisco-IOS-XE-rpc:copy",
+     '<copy xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-rpc">'
+     "<source-drop-node-name>running-config</source-drop-node-name>"
+     "<destination-drop-node-name>startup-config</destination-drop-node-name>"
+     "</copy>"),
+]
+
+
+def save_config(conn, args) -> dict:
+    """Persist running-config to startup-config (NETCONF equivalent of
+    `write memory`). A committed change only reaches running; without this a
+    reload silently reverts it. Saves the WHOLE running config, not just the
+    last change."""
+    device_name = conn.get("device_name") or conn["host"]
+    attempts = []
+    try:
+        with _session(conn) as m:
+            for method, rpc_xml in _SAVE_CONFIG_RPCS:
+                try:
+                    reply = m.dispatch(to_ele(rpc_xml))
+                except RPCError as e:
+                    attempts.append({"method": method, "error": str(e),
+                                     "rpc_tag": getattr(e, "tag", None)})
+                    continue
+                xml_str = reply.xml if hasattr(reply, "xml") else str(reply)
+                tree = _etree.fromstring(xml_str.encode() if isinstance(xml_str, str) else xml_str)
+                result_nodes = tree.xpath(".//*[local-name()='result']")
+                return {
+                    "success": True,
+                    "host": conn["host"],
+                    "device_name": device_name,
+                    "method": method,
+                    "result": result_nodes[0].text.strip() if result_nodes and result_nodes[0].text else None,
+                    "failed_attempts": attempts,
+                }
+    except Exception as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": str(e), "error_type": type(e).__name__, "failed_attempts": attempts}
+    return {"success": False, "host": conn["host"], "device_name": device_name,
+            "error": "no supported save-config RPC on this device — running-config NOT saved to startup",
+            "error_type": "SaveUnsupported", "failed_attempts": attempts}
+
+
 _DISPATCH = {
     "netconf-is-alive": is_alive,
     "netconf-get-config": get_config,
@@ -665,6 +718,7 @@ _DISPATCH = {
     "netconf-preview-config": preview_config,
     "netconf-send-command": send_command,
     "netconf-discard": discard,
+    "netconf-save-config": save_config,
 }
 
 

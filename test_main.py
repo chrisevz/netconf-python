@@ -184,6 +184,44 @@ class SendConfigXmlTests(unittest.TestCase):
         m.commit.assert_called_once()
 
 
+class SaveConfigTests(unittest.TestCase):
+    """save_config tries cisco-ia first, then falls back to Cisco-IOS-XE-rpc copy."""
+
+    def _run(self, dispatch_side_effect):
+        m = MagicMock()
+        m.dispatch.side_effect = dispatch_side_effect
+        session = MagicMock()
+        session.__enter__.return_value = m
+        with patch.object(main, "_session", return_value=session):
+            return main.save_config({"host": "10.0.0.1"}, MagicMock()), m
+
+    @staticmethod
+    def _reply(text):
+        r = MagicMock()
+        r.xml = ('<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+                 f'<result xmlns="http://cisco.com/yang/cisco-ia">{text}</result></rpc-reply>')
+        return r
+
+    def test_uses_cisco_ia_when_available(self):
+        result, m = self._run([self._reply("Save running-config successful")])
+        self.assertTrue(result["success"])
+        self.assertEqual(result["method"], "cisco-ia:save-config")
+        self.assertEqual(result["result"], "Save running-config successful")
+        self.assertEqual(m.dispatch.call_count, 1)
+
+    def test_falls_back_to_copy_rpc(self):
+        result, m = self._run([_make_rpc_error("unknown-element"), self._reply("[OK]")])
+        self.assertTrue(result["success"])
+        self.assertEqual(result["method"], "Cisco-IOS-XE-rpc:copy")
+        self.assertEqual(len(result["failed_attempts"]), 1)
+
+    def test_reports_unsupported_when_both_fail(self):
+        result, _ = self._run([_make_rpc_error("unknown-element"), _make_rpc_error("unknown-element")])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "SaveUnsupported")
+        self.assertEqual(len(result["failed_attempts"]), 2)
+
+
 class FormatForHumansTests(unittest.TestCase):
     def test_is_alive_returns_full_json_including_version(self):
         result = {"success": True, "alive": True, "host": "10.0.0.1", "output": "17.15"}
