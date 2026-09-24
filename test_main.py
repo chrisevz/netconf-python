@@ -8,6 +8,7 @@ change, and preview_mode selection choosing "xml-diff" on an unsupported
 render RPC rather than failing.
 """
 
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -181,6 +182,12 @@ class SendConfigXmlTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["validate"], "unsupported")
         m.commit.assert_called_once()
+
+
+class FormatForHumansTests(unittest.TestCase):
+    def test_is_alive_returns_full_json_including_version(self):
+        result = {"success": True, "alive": True, "host": "10.0.0.1", "output": "17.15"}
+        self.assertEqual(json.loads(main._format_for_humans(result, "netconf-is-alive")), result)
 
 
 if __name__ == "__main__":
