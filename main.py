@@ -539,57 +539,73 @@ def send_command(conn, args) -> dict:
                         "actual_running_hash": actual_hash,
                     }
 
-            use_candidate = _has_candidate(m)
+            # Fail closed, same as preview. Editing running directly would apply
+            # the change live with no preview parity and no commit-level
+            # rollback — the spec requires candidate + commit for every push.
+            if not _has_candidate(m):
+                return {"success": False, "host": conn["host"], "device_name": device_name,
+                        "error": "device has no candidate datastore — netconf-send-config-xml requires it",
+                        "error_type": "NoCandidate"}
 
-            if use_candidate:
-                lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
-                try:
-                    # IOS XE's candidate is a single global datastore, not per-session.
-                    # The lock grants exclusive write access; it does NOT guarantee an
-                    # empty candidate. Without this, edit_config stacks on top of
-                    # whatever a prior or killed session left staged, and commit
-                    # pushes all of it.
-                    m.discard_changes()
+            lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
+            try:
+                # IOS XE's candidate is a single global datastore, not per-session.
+                # The lock grants exclusive write access; it does NOT guarantee an
+                # empty candidate. Without this, edit_config stacks on top of
+                # whatever a prior or killed session left staged, and commit
+                # pushes all of it.
+                m.discard_changes()
 
-                    m.edit_config(target="candidate", config=config_xml)
-                    commit_reply = m.commit()
+                m.edit_config(target="candidate", config=config_xml)
 
-                    return {
-                        "success": True,
-                        "host": conn["host"],
-                        "device_name": device_name,
-                        "lock_wait_seconds": round(lock_wait, 2),
-                        "datastore": "candidate",
-                        "commit": getattr(commit_reply, "xml", str(commit_reply)),
-                    }
-                except Exception as inner:
+                # Validate before commit when the device supports it. A failure
+                # here refuses the commit; the except below discards the candidate.
+                validate_result = "unsupported"
+                if _has_validate(m):
                     try:
+                        m.validate(source="candidate")
+                        validate_result = "valid"
+                    except RPCError as e:
                         m.discard_changes()
-                    except Exception:
-                        pass
-                    return {
-                        "success": False,
-                        "host": conn["host"],
-                        "device_name": device_name,
-                        "error": str(inner),
-                        "error_type": type(inner).__name__,
-                    }
-                finally:
-                    try:
-                        m.unlock(target="candidate")
-                    except Exception:
-                        pass
-            else:
-                # No candidate datastore — edit running directly (no lock, no
-                # separate commit step; editing running target IS the commit).
-                m.edit_config(target="running", config=config_xml)
+                        return {
+                            "success": False,
+                            "host": conn["host"],
+                            "device_name": device_name,
+                            "error": f"candidate failed validation — not committed: {e}",
+                            "error_type": "ValidationFailed",
+                            "rpc_tag": getattr(e, "tag", None),
+                            "rpc_path": getattr(e, "path", None),
+                            "committed": False,
+                        }
+
+                commit_reply = m.commit()
+
                 return {
                     "success": True,
                     "host": conn["host"],
                     "device_name": device_name,
-                    "datastore": "running",
-                    "lock_wait_seconds": 0,
+                    "lock_wait_seconds": round(lock_wait, 2),
+                    "datastore": "candidate",
+                    "validate": validate_result,
+                    "commit": getattr(commit_reply, "xml", str(commit_reply)),
                 }
+            except Exception as inner:
+                try:
+                    m.discard_changes()
+                except Exception:
+                    pass
+                return {
+                    "success": False,
+                    "host": conn["host"],
+                    "device_name": device_name,
+                    "error": str(inner),
+                    "error_type": type(inner).__name__,
+                }
+            finally:
+                try:
+                    m.unlock(target="candidate")
+                except Exception:
+                    pass
 
     except RPCError as e:
         return {"success": False, "host": conn["host"], "device_name": device_name,

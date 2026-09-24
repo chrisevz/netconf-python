@@ -9,7 +9,7 @@ render RPC rather than failing.
 """
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import lxml.etree as etree
 from ncclient.operations.rpc import RPCError
@@ -135,6 +135,52 @@ class PreviewRenderTests(unittest.TestCase):
             "</rpc-reply>"
         )
         return reply
+
+
+class SendConfigXmlTests(unittest.TestCase):
+    """send_command's push path, with a mocked ncclient manager."""
+
+    CANDIDATE = "urn:ietf:params:netconf:capability:candidate:1.0"
+    VALIDATE = "urn:ietf:params:netconf:capability:validate:1.1"
+
+    def _run(self, capabilities, validate_error=None):
+        m = MagicMock()
+        m.server_capabilities = capabilities
+        if validate_error is not None:
+            m.validate.side_effect = validate_error
+        session = MagicMock()
+        session.__enter__.return_value = m
+        conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+        args = MagicMock(config_xml="<config/>", expect_running_hash=None)
+        with patch.object(main, "_session", return_value=session), \
+             patch.object(main, "_acquire_candidate_lock", return_value=0.0):
+            return main.send_command(conn, args), m
+
+    def test_refuses_without_candidate_and_never_edits_running(self):
+        result, m = self._run([])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "NoCandidate")
+        m.edit_config.assert_not_called()
+
+    def test_commits_after_successful_validate(self):
+        result, m = self._run([self.CANDIDATE, self.VALIDATE])
+        self.assertTrue(result["success"])
+        self.assertEqual(result["validate"], "valid")
+        m.commit.assert_called_once()
+
+    def test_validation_failure_discards_and_does_not_commit(self):
+        result, m = self._run([self.CANDIDATE, self.VALIDATE], validate_error=_make_rpc_error("invalid-value"))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "ValidationFailed")
+        m.commit.assert_not_called()
+        m.discard_changes.assert_called()
+        m.unlock.assert_called_once_with(target="candidate")
+
+    def test_commits_when_validate_unsupported(self):
+        result, m = self._run([self.CANDIDATE])
+        self.assertTrue(result["success"])
+        self.assertEqual(result["validate"], "unsupported")
+        m.commit.assert_called_once()
 
 
 if __name__ == "__main__":
