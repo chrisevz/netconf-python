@@ -109,6 +109,17 @@ decorators:
             error_type=ConfigDrift instead of applying an approved diff to
             config that has since moved.
           type: string
+        confirm_timeout:
+          description: >-
+            Seconds for a persistent confirmed commit. If set, the change goes
+            live but the DEVICE rolls it back by itself when this many seconds
+            pass unless netconf-confirm-commit is called with the returned
+            persist_id first — so a dead workflow or gateway still ends in a
+            rollback. The result carries persist_id and confirm_deadline_utc.
+            The device must advertise :confirmed-commit:1.1, otherwise nothing is
+            pushed (no fallback to a plain commit). Empty/unset = plain commit.
+          type: integer
+          minimum: 1
         lock_timeout:
           description: Seconds to wait for candidate datastore lock (0 = fail immediately)
           type: integer
@@ -118,6 +129,38 @@ decorators:
           type: integer
           default: 90
       required: [config_xml]
+      additionalProperties: false
+
+  - name: netconf-confirm-commit-input
+    schema:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      title: netconf-confirm-commit inputs
+      type: object
+      properties:
+        persist_id:
+          description: The persist_id returned by the netconf-send-config-xml call that started the confirmed commit.
+          type: string
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
+      required: [persist_id]
+      additionalProperties: false
+
+  - name: netconf-cancel-commit-input
+    schema:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      title: netconf-cancel-commit inputs
+      type: object
+      properties:
+        persist_id:
+          description: The persist_id returned by the netconf-send-config-xml call that started the confirmed commit.
+          type: string
+        timeout:
+          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
+          type: integer
+          default: 90
+      required: [persist_id]
       additionalProperties: false
 
   - name: netconf-discard-input
@@ -227,4 +270,34 @@ services:
     runtime:
       env:
         NETCONF_OP: netconf-save-config
+    tags: [driver, iosxe, netconf, cisco]
+
+  - name: netconf-confirm-commit
+    type: python-script
+    description: >-
+      Cisco IOS XE NETCONF — confirm a pending persistent confirmed commit
+      started by netconf-send-config-xml with confirm_timeout, using its
+      persist_id. Makes the change permanent in running; it does not save to
+      startup (run netconf-save-config after). Fails if the device's timer
+      already ran out and it rolled the change back on its own.
+    repository: netconf-python
+    filename: main.py
+    decorator: netconf-confirm-commit-input
+    runtime:
+      env:
+        NETCONF_OP: netconf-confirm-commit
+    tags: [driver, iosxe, netconf, cisco]
+
+  - name: netconf-cancel-commit
+    type: python-script
+    description: >-
+      Cisco IOS XE NETCONF — cancel a pending persistent confirmed commit now
+      (using its persist_id), rolling the device back immediately instead of
+      waiting for its timer.
+    repository: netconf-python
+    filename: main.py
+    decorator: netconf-cancel-commit-input
+    runtime:
+      env:
+        NETCONF_OP: netconf-cancel-commit
     tags: [driver, iosxe, netconf, cisco]

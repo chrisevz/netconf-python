@@ -13,7 +13,7 @@ work resumes later.
 
 Actions: netconf-is-alive, netconf-get-config, netconf-get-config-clis,
 netconf-preview-config, netconf-send-command, netconf-discard,
-netconf-save-config.
+netconf-save-config, netconf-confirm-commit, netconf-cancel-commit.
 
 netconf-preview-config is the core feature: it stages a proposed config_xml
 change into the candidate datastore, renders/diffs it against running, and
@@ -34,8 +34,16 @@ discard any stray staged content, edit, commit. Refuses to touch running
 config with expect_running_hash set if running has drifted since a prior
 netconf-preview-config call captured its hash.
 
+netconf-send-command with confirm_timeout makes that commit a persistent
+confirmed commit: the change is live, but the device reverts it by itself when
+the timer runs out unless netconf-confirm-commit is called with the returned
+persist_id first (netconf-cancel-commit rolls it back immediately). The timer
+lives on the device, so it fires even if the caller dies. Devices without
+:confirmed-commit:1.1 are refused, never pushed to with a plain commit.
+
 netconf-save-config copies running-config to startup-config (write memory)
-after a successful push, so the change survives a reload.
+after a successful push, so the change survives a reload. With a confirmed
+commit, save only after netconf-confirm-commit succeeds.
 
 netconf-discard clears a dirty candidate out of band (e.g. after a refused
 preview) — it does not pair with any staging mode, there isn't one.
@@ -72,7 +80,9 @@ import json
 import os
 import sys
 import time
+import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 import lxml.etree as _etree
 
@@ -145,6 +155,16 @@ def _has_candidate(m) -> bool:
 
 def _has_validate(m) -> bool:
     return _has_capability(m, "validate")
+
+
+def _has_persistent_confirmed_commit(m) -> bool:
+    """True only for :confirmed-commit:1.1 (RFC 6241 §8.4). Version 1.0 is not
+    enough: its confirmed commit is tied to the session that issued it and
+    reverts as soon as that session closes, and every service call here is a
+    fresh session. Only 1.1's persist / persist-id lets a later call confirm
+    or cancel."""
+    prefix = "urn:ietf:params:netconf:capability:confirmed-commit:1.1"
+    return any(str(cap).startswith(prefix) for cap in m.server_capabilities)
 
 
 def _get_config_xml(m, source: str, filter_xml: str = None) -> str:
@@ -223,6 +243,9 @@ def is_alive(conn, args) -> dict:
                 "host": conn["host"],
                 "device_name": device_name,
                 "output": version,
+                # Lets a workflow refuse a device that cannot do a persistent
+                # confirmed commit before any operator time is spent.
+                "persist_confirmed_commit": _has_persistent_confirmed_commit(m),
             }
     except (AuthenticationError, SSHError) as e:
         return {"success": False, "alive": False, "host": conn["host"], "device_name": device_name,
@@ -515,13 +538,23 @@ def send_command(conn, args) -> dict:
     no do_commit=false staging mode. IOS XE's candidate is a single global
     datastore, not per-session: a second workflow run, or any other
     session, would merge into or clobber a candidate left staged across an
-    operator review, so staging-then-later-finishing is not supported."""
+    operator review, so staging-then-later-finishing is not supported.
+
+    With confirm_timeout set the commit is a persistent confirmed commit
+    (RFC 6241 :confirmed-commit:1.1): the change goes live but the DEVICE
+    reverts it on its own when the timer expires unless a later
+    netconf-confirm-commit call presents the returned persist_id. So if the
+    workflow, the gateway or this process dies mid-review, the device still
+    rolls back. Fail closed: if the device does not advertise 1.1 nothing is
+    edited or committed, and there is no fallback to a plain commit."""
     device_name = conn.get("device_name") or conn["host"]
     config_xml = getattr(args, "config_xml", None)
     if not config_xml:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "error": "config_xml is required for action=netconf-send-command"}
     expect_running_hash = getattr(args, "expect_running_hash", None)
+    confirm_timeout = getattr(args, "confirm_timeout", None)
+    persist_id = uuid.uuid4().hex if confirm_timeout else None
 
     try:
         with _session(conn) as m:
@@ -550,6 +583,13 @@ def send_command(conn, args) -> dict:
                 return {"success": False, "host": conn["host"], "device_name": device_name,
                         "error": "device has no candidate datastore — netconf-send-config-xml requires it",
                         "error_type": "NoCandidate"}
+
+            if confirm_timeout and not _has_persistent_confirmed_commit(m):
+                return {"success": False, "host": conn["host"], "device_name": device_name,
+                        "error": "device does not advertise :confirmed-commit:1.1 — refusing to push "
+                                 "without a device-side rollback timer (no fallback to a plain commit)",
+                        "error_type": "NoConfirmedCommit",
+                        "committed": False}
 
             lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
             try:
@@ -582,9 +622,19 @@ def send_command(conn, args) -> dict:
                             "committed": False,
                         }
 
-                commit_reply = m.commit()
+                if confirm_timeout:
+                    # Take the timestamp BEFORE the commit: the device starts its
+                    # timer while processing the commit, so a deadline computed
+                    # from before the call can only be earlier than the real one,
+                    # never later.
+                    started = datetime.now(timezone.utc)
+                    commit_reply = m.commit(confirmed=True, timeout=str(confirm_timeout),
+                                            persist=persist_id)
+                    deadline = started + timedelta(seconds=confirm_timeout)
+                else:
+                    commit_reply = m.commit()
 
-                return {
+                result = {
                     "success": True,
                     "host": conn["host"],
                     "device_name": device_name,
@@ -592,19 +642,34 @@ def send_command(conn, args) -> dict:
                     "datastore": "candidate",
                     "validate": validate_result,
                     "commit": getattr(commit_reply, "xml", str(commit_reply)),
+                    "confirmed_commit": bool(confirm_timeout),
                 }
+                if confirm_timeout:
+                    result.update({
+                        "persist_id": persist_id,
+                        "confirm_timeout": confirm_timeout,
+                        "confirm_deadline_utc": deadline.strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                return result
             except Exception as inner:
                 try:
                     m.discard_changes()
                 except Exception:
                     pass
-                return {
+                failure = {
                     "success": False,
                     "host": conn["host"],
                     "device_name": device_name,
                     "error": str(inner),
                     "error_type": type(inner).__name__,
                 }
+                if confirm_timeout:
+                    # If the commit reply was lost after the device applied it, the
+                    # device state is unknown here. The persist_id lets a caller
+                    # cancel it, and the device reverts it on its own at the timer.
+                    failure["persist_id"] = persist_id
+                    failure["confirmed_commit_state"] = "unknown"
+                return failure
             finally:
                 try:
                     m.unlock(target="candidate")
@@ -659,6 +724,74 @@ def discard(conn, args) -> dict:
                 "rpc_path": getattr(e, "path", None)}
     except Exception as e:
         return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": str(e), "error_type": type(e).__name__}
+
+
+def _rpc_failure(conn, device_name, e) -> dict:
+    return {"success": False, "host": conn["host"], "device_name": device_name,
+            "error": str(e), "error_type": "RPCError",
+            "rpc_tag": getattr(e, "tag", None),
+            "rpc_type": getattr(e, "type", None),
+            "rpc_severity": getattr(e, "severity", None),
+            "rpc_info": getattr(e, "info", None),
+            "rpc_path": getattr(e, "path", None)}
+
+
+def confirm_commit(conn, args) -> dict:
+    """Confirm a pending persistent confirmed commit started by
+    netconf-send-command with confirm_timeout. Sends the confirming <commit>
+    carrying the persist_id, which makes the change permanent in running. It
+    does NOT save to startup — run netconf-save-config after this succeeds.
+
+    Failure is expected and meaningful when the device's timer already ran out:
+    the change was rolled back on its own and there is no pending confirmed
+    commit left to confirm (a late click, or a device that lost management
+    reachability after the push). success=False / confirmed=False means the
+    change is NOT confirmed — treat the device as rolled back and verify."""
+    device_name = conn.get("device_name") or conn["host"]
+    persist_id = getattr(args, "persist_id", None)
+    if not persist_id:
+        return {"success": False, "confirmed": False, "host": conn["host"], "device_name": device_name,
+                "error": "persist_id is required for action=netconf-confirm-commit"}
+    try:
+        with _session(conn) as m:
+            if not _has_persistent_confirmed_commit(m):
+                return {"success": False, "confirmed": False, "host": conn["host"],
+                        "device_name": device_name,
+                        "error": "device does not advertise :confirmed-commit:1.1",
+                        "error_type": "NoConfirmedCommit"}
+            m.commit(persist_id=persist_id)
+            return {"success": True, "confirmed": True, "host": conn["host"],
+                    "device_name": device_name, "persist_id": persist_id}
+    except RPCError as e:
+        return dict(_rpc_failure(conn, device_name, e), confirmed=False)
+    except Exception as e:
+        return {"success": False, "confirmed": False, "host": conn["host"], "device_name": device_name,
+                "error": str(e), "error_type": type(e).__name__}
+
+
+def cancel_commit(conn, args) -> dict:
+    """Cancel a pending persistent confirmed commit now, rolling the device back
+    to the config it had before the push instead of waiting for the timer."""
+    device_name = conn.get("device_name") or conn["host"]
+    persist_id = getattr(args, "persist_id", None)
+    if not persist_id:
+        return {"success": False, "rolled_back": False, "host": conn["host"], "device_name": device_name,
+                "error": "persist_id is required for action=netconf-cancel-commit"}
+    try:
+        with _session(conn) as m:
+            if not _has_persistent_confirmed_commit(m):
+                return {"success": False, "rolled_back": False, "host": conn["host"],
+                        "device_name": device_name,
+                        "error": "device does not advertise :confirmed-commit:1.1",
+                        "error_type": "NoConfirmedCommit"}
+            m.cancel_commit(persist_id=persist_id)
+            return {"success": True, "rolled_back": True, "host": conn["host"],
+                    "device_name": device_name, "persist_id": persist_id}
+    except RPCError as e:
+        return dict(_rpc_failure(conn, device_name, e), rolled_back=False)
+    except Exception as e:
+        return {"success": False, "rolled_back": False, "host": conn["host"], "device_name": device_name,
                 "error": str(e), "error_type": type(e).__name__}
 
 
@@ -719,6 +852,8 @@ _DISPATCH = {
     "netconf-send-command": send_command,
     "netconf-discard": discard,
     "netconf-save-config": save_config,
+    "netconf-confirm-commit": confirm_commit,
+    "netconf-cancel-commit": cancel_commit,
 }
 
 
@@ -826,15 +961,28 @@ def build_parser() -> argparse.ArgumentParser:
                         help="A complete, pre-built NETCONF <config> XML payload — pushed as-is via "
                              "edit-config. Required for netconf-preview-config and "
                              "netconf-send-command.")
+    parser.add_argument("--confirm_timeout", "--confirm-timeout", dest="confirm_timeout",
+                        type=_optional_int, default=None,
+                        help="netconf-send-command only — seconds. If set, the commit is a persistent "
+                             "confirmed commit: the device rolls the change back on its own unless "
+                             "netconf-confirm-commit is called with the returned persist_id in time. "
+                             "Unset = plain commit.")
+    parser.add_argument("--persist_id", "--persist-id", dest="persist_id", default=None,
+                        help="netconf-confirm-commit / netconf-cancel-commit — the persist_id "
+                             "returned by the netconf-send-command call that started the confirmed commit.")
     parser.add_argument("--source", "--datastore", dest="source", default=None)
     parser.add_argument("--filter", default=None)
     return parser
 
 
 def _normalize_args(args):
-    for attr in ("source", "filter", "host", "user", "password", "config_xml", "expect_running_hash"):
+    for attr in ("source", "filter", "host", "user", "password", "config_xml", "expect_running_hash",
+                 "persist_id"):
         if getattr(args, attr, None) == "":
             setattr(args, attr, None)
+
+    if getattr(args, "confirm_timeout", None) is not None and args.confirm_timeout <= 0:
+        raise SystemExit(f"--confirm_timeout must be a positive number of seconds, got {args.confirm_timeout}")
 
     val = getattr(args, "force_discard", None)
     if val is None or val == "":

@@ -27,6 +27,28 @@ later phase — it isn't part of this repo anymore).
 | `netconf-preview-config` | **The core feature.** Stage a proposed `config_xml` change, diff it against running, then discard | Never commits. See "Preview and push workflow" below. |
 | `netconf-send-command` (service name: `netconf-send-config-xml`) | Apply `config_xml` for real (commit) | The only push path — see below. |
 | `netconf-discard` | Discard whatever is staged in candidate | Clears a dirty candidate (e.g. one flagged by a preview call) out of band. |
+| `netconf-confirm-commit` | Confirm a pending persistent confirmed commit | Takes the `persist_id` returned by a push that used `confirm_timeout`. Makes the change permanent in running; does not save to startup. Fails if the device's timer already rolled the change back. |
+| `netconf-cancel-commit` | Roll a pending persistent confirmed commit back now | Takes the same `persist_id`. |
+
+### Confirmed push (`confirm_timeout`)
+
+`netconf-send-config-xml` with `confirm_timeout` (seconds) does a **persistent confirmed
+commit** (RFC 6241 `:confirmed-commit:1.1`): the change goes live, but the **device**
+reverts it on its own when the timer runs out unless `netconf-confirm-commit` is called
+with the returned `persist_id` first. Because the timer lives on the device, a dead
+workflow, gateway or process still ends in a rollback. Results carry `persist_id`,
+`confirm_timeout` and `confirm_deadline_utc`.
+
+- **Fails closed:** a device that does not advertise `:confirmed-commit:1.1` is refused
+  (`error_type=NoConfirmedCommit`) before anything is edited — there is no fallback to a
+  plain commit. Version 1.0 is not enough: its confirmed commit reverts as soon as the
+  pushing session closes, and every service call is a new session.
+- `netconf-is-alive` reports `persist_confirmed_commit` so a workflow can refuse such a
+  device before any operator time is spent.
+- Save to startup (`netconf-save-config`) only **after** `netconf-confirm-commit` succeeds.
+- If the commit reply is lost, the failure result still carries `persist_id` with
+  `confirmed_commit_state=unknown`; the device reverts it at the timer regardless.
+- Leaving `confirm_timeout` unset keeps the old plain-commit behaviour.
 
 ## Preview and push workflow
 
