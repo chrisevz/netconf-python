@@ -797,7 +797,7 @@ def cancel_commit(conn, args) -> dict:
 
 # Two ways IOS XE exposes "write memory" over NETCONF. Which one a given
 # image carries is not advertised reliably, so try them in order and report
-# which one worked. (tcs91 was reported without cisco-ia on an earlier image —
+# which one worked. (A lab switch was reported without cisco-ia on an earlier image —
 # hence the fallback.)
 _SAVE_CONFIG_RPCS = [
     ("cisco-ia:save-config", '<save-config xmlns="http://cisco.com/yang/cisco-ia"/>'),
