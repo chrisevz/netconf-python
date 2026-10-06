@@ -139,6 +139,207 @@ class PreviewRenderTests(unittest.TestCase):
         return reply
 
 
+class SideBySideRowsTests(unittest.TestCase):
+    """_side_by_side_rows: the diff as plain data (old left, new right) for the approval screen."""
+
+    @staticmethod
+    def _lines(n):
+        return [f"line{i}" for i in range(n)]
+
+    def test_identical_text_has_no_rows(self):
+        rows, stats = main._side_by_side_rows("a\nb\nc", "a\nb\nc")
+        self.assertEqual(rows, [])
+        self.assertEqual(stats, {"added": 0, "removed": 0, "truncated": False})
+
+    def test_one_change_keeps_three_lines_of_context_and_gaps_elsewhere(self):
+        old = self._lines(20)
+        new = list(old)
+        new[10] = "CHANGED"
+        rows, stats = main._side_by_side_rows("\n".join(old), "\n".join(new))
+        self.assertEqual([r["kind"] for r in rows],
+                         ["gap", "same", "same", "same", "change", "same", "same", "same", "gap"])
+        self.assertEqual(rows[0]["hidden"], 7)
+        self.assertEqual(rows[-1]["hidden"], 6)
+        change = rows[4]
+        self.assertEqual((change["old_no"], change["old"], change["old_mark"]), (11, "line10", "del"))
+        self.assertEqual((change["new_no"], change["new"], change["new_mark"]), (11, "CHANGED", "add"))
+        self.assertEqual((rows[1]["old_no"], rows[1]["new_no"]), (8, 8))
+        self.assertEqual(stats, {"added": 1, "removed": 1, "truncated": False})
+
+    def test_added_lines_sit_opposite_an_empty_old_side(self):
+        rows, stats = main._side_by_side_rows("a\nb", "a\nX\nY\nb")
+        added = [r for r in rows if r["kind"] == "change"]
+        self.assertEqual([r["new"] for r in added], ["X", "Y"])
+        for r in added:
+            self.assertIsNone(r["old_no"])
+            self.assertEqual((r["old"], r["old_mark"], r["new_mark"]), ("", "", "add"))
+        self.assertEqual((added[0]["new_no"], added[1]["new_no"]), (2, 3))
+        self.assertEqual(stats["added"], 2)
+        self.assertEqual(stats["removed"], 0)
+
+    def test_removed_lines_sit_opposite_an_empty_new_side(self):
+        rows, stats = main._side_by_side_rows("a\nX\nb", "a\nb")
+        removed = [r for r in rows if r["kind"] == "change"]
+        self.assertEqual(len(removed), 1)
+        self.assertEqual((removed[0]["old_no"], removed[0]["old"], removed[0]["old_mark"]), (2, "X", "del"))
+        self.assertIsNone(removed[0]["new_no"])
+        self.assertEqual(removed[0]["new_mark"], "")
+        self.assertEqual((stats["added"], stats["removed"]), (0, 1))
+
+    def test_replaced_block_is_paired_and_the_shorter_side_is_padded(self):
+        rows, _ = main._side_by_side_rows("a\nb\nc\nd", "a\nX\nd")
+        changes = [r for r in rows if r["kind"] == "change"]
+        self.assertEqual([(r["old"], r["new"]) for r in changes], [("b", "X"), ("c", "")])
+        self.assertEqual(changes[1]["new_mark"], "")
+        self.assertIsNone(changes[1]["new_no"])
+
+    def test_text_is_returned_raw_not_html_escaped(self):
+        rows, _ = main._side_by_side_rows("a", "a\n<b>&amp;</b>")
+        self.assertEqual([r["new"] for r in rows if r["kind"] == "change"], ["<b>&amp;</b>"])
+
+    def test_trailing_whitespace_is_ignored_but_blank_lines_are_kept(self):
+        rows, _ = main._side_by_side_rows("a  \n\nb", "a\n\nb\nc")
+        self.assertEqual([r["new"] for r in rows if r["kind"] == "change"], ["c"])
+        self.assertIn("", [r["old"] for r in rows if r["kind"] == "same"])
+
+    def test_row_cap_truncates_and_says_so(self):
+        old = self._lines(40)
+        new = [f"changed{i}" for i in range(40)]
+        rows, stats = main._side_by_side_rows("\n".join(old), "\n".join(new), max_rows=10)
+        self.assertEqual(len(rows), 11)
+        self.assertEqual(rows[-1], {"kind": "gap", "hidden": 30})
+        self.assertTrue(stats["truncated"])
+
+    def test_first_build_against_an_empty_config_is_all_additions(self):
+        rows, stats = main._side_by_side_rows("", "hostname x\nntp server 1.2.3.4")
+        self.assertEqual([r["kind"] for r in rows], ["change", "change"])
+        self.assertEqual((stats["added"], stats["removed"]), (2, 0))
+
+
+class ParallelRenderTests(unittest.TestCase):
+    """The running-config render overlaps the staging work in a second session."""
+
+    @staticmethod
+    def _background(result="running text\n", error=None, exc=None, seconds=1.5):
+        thread = MagicMock()
+        return thread, {"result": result, "error": error, "exc": exc, "seconds": seconds}
+
+    def test_uses_the_background_running_render_and_renders_only_candidate_here(self):
+        m = MagicMock()
+        m.dispatch.side_effect = [PreviewRenderTests._fake_reply("candidate text\n")]
+        thread, box = self._background()
+        result = main._preview_render(m, "<running/>", "<candidate/>", (thread, box))
+        thread.join.assert_called_once()
+        self.assertEqual(m.dispatch.call_count, 1)
+        self.assertEqual(result["preview_mode"], "device-rendered")
+        self.assertIn("running text", result["running_config"])
+        self.assertIn("candidate text", result["candidate_config"])
+        self.assertTrue(result["timings"]["parallel"])
+        self.assertEqual(result["timings"]["running_render_s"], 1.5)
+        self.assertIn("candidate_render_s", result["timings"])
+        self.assertTrue(result["diff_rows"])
+
+    def test_falls_back_to_rendering_running_here_when_the_second_session_failed(self):
+        m = MagicMock()
+        m.dispatch.side_effect = [PreviewRenderTests._fake_reply("candidate text\n"),
+                                  PreviewRenderTests._fake_reply("running text\n")]
+        thread, box = self._background(result=None, exc=RuntimeError("too many sessions"), seconds=0.1)
+        result = main._preview_render(m, "<running/>", "<candidate/>", (thread, box))
+        self.assertEqual(m.dispatch.call_count, 2)
+        self.assertEqual(result["preview_mode"], "device-rendered")
+        self.assertIn("running text", result["running_config"])
+        self.assertFalse(result["timings"]["parallel"])
+
+    def test_unsupported_render_rpc_still_ends_in_the_xml_diff(self):
+        m = MagicMock()
+        m.dispatch.side_effect = _make_rpc_error()
+        thread, box = self._background(result=None, error="get-modelled-config-clis RPC not supported")
+        result = main._preview_render(m, "<config><a>1</a></config>", "<config><a>2</a></config>", (thread, box))
+        self.assertEqual(result["preview_mode"], "xml-diff")
+        self.assertTrue(result["has_changes"])
+        self.assertTrue(result["diff_rows"])
+
+    def test_without_background_the_two_renders_run_one_after_the_other(self):
+        m = MagicMock()
+        m.dispatch.side_effect = [PreviewRenderTests._fake_reply("running text\n"),
+                                  PreviewRenderTests._fake_reply("candidate text\n")]
+        result = main._preview_render(m, "<running/>", "<candidate/>")
+        self.assertFalse(result["timings"]["parallel"])
+        self.assertIn("running text", result["running_config"])
+
+    def test_background_render_uses_its_own_session_and_returns_the_text(self):
+        m2 = MagicMock()
+        m2.dispatch.return_value = PreviewRenderTests._fake_reply("running text\n")
+        session = MagicMock()
+        session.__enter__.return_value = m2
+        conn = {"host": "10.0.0.1"}
+        with patch.object(main, "_session", return_value=session) as opened:
+            thread, box = main._start_background_render(conn, "running")
+            thread.join(5)
+        opened.assert_called_once_with(conn)
+        self.assertIsNone(box["exc"])
+        self.assertIn("running text", box["result"])
+        self.assertIsNotNone(box["seconds"])
+        self.assertTrue(thread.daemon)
+
+    def test_background_render_reports_a_failed_session_instead_of_raising(self):
+        with patch.object(main, "_session", side_effect=RuntimeError("no session")):
+            thread, box = main._start_background_render({"host": "10.0.0.1"}, "running")
+            thread.join(5)
+        self.assertIsInstance(box["exc"], RuntimeError)
+        self.assertIsNone(box["result"])
+
+
+class PreviewConfigFlowTests(unittest.TestCase):
+    """preview_config end to end with a mocked manager: ordering and result shape."""
+
+    def _run(self, diff=True):
+        m = MagicMock()
+        m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0"]
+        m.dispatch.side_effect = [PreviewRenderTests._fake_reply("hostname a\ndescription new\n")]
+        session = MagicMock()
+        session.__enter__.return_value = m
+        order = MagicMock()
+        thread = MagicMock()
+        box = {"result": "hostname a\ndescription old\n", "error": None, "exc": None, "seconds": 2.0}
+        order.start.return_value = (thread, box)
+        order.lock.return_value = 0.0
+        conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+        args = MagicMock(config_xml="<config/>", force_discard=False, diff=diff)
+        with patch.object(main, "_session", return_value=session), \
+             patch.object(main, "_start_background_render", order.start), \
+             patch.object(main, "_acquire_candidate_lock", order.lock), \
+             patch.object(main, "_get_config_xml", side_effect=["<a>1</a>", "<a>1</a>", "<a>2</a>"]):
+            result = main.preview_config(conn, args)
+        return result, order, m
+
+    def test_background_render_starts_before_the_candidate_lock(self):
+        result, order, _ = self._run()
+        self.assertTrue(result["success"])
+        names = [c[0] for c in order.mock_calls if c[0] in ("start", "lock")]
+        self.assertEqual(names, ["start", "lock"])
+        order.start.assert_called_once_with({"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1},
+                                            "running")
+
+    def test_result_carries_side_by_side_rows_stats_and_timings(self):
+        result, _, m = self._run()
+        self.assertEqual(result["preview_mode"], "device-rendered")
+        self.assertTrue(result["has_changes"])
+        changes = [r for r in result["diff_rows"] if r["kind"] == "change"]
+        self.assertEqual([(r["old"], r["new"]) for r in changes], [("description old", "description new")])
+        self.assertEqual(result["diff_stats"]["added"], 1)
+        self.assertTrue(result["timings"]["parallel"])
+        self.assertFalse(result["committed"])
+        m.discard_changes.assert_called()
+        m.unlock.assert_called_once_with(target="candidate")
+
+    def test_diff_false_drops_every_form_of_the_diff(self):
+        result, _, _ = self._run(diff=False)
+        self.assertIsNone(result["diff"])
+        self.assertIsNone(result["diff_rows"])
+        self.assertIsNone(result["diff_stats"])
+
+
 class SendConfigXmlTests(unittest.TestCase):
     """send_command's push path, with a mocked ncclient manager."""
 

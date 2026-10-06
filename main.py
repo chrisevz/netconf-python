@@ -79,6 +79,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -346,44 +347,177 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256(_normalize_text(text).encode("utf-8")).hexdigest()[:16]
 
 
-def _preview_render(m, running_xml: str, candidate_after_xml: str) -> dict:
+_DIFF_CONTEXT_LINES = 3
+_DIFF_MAX_ROWS = 5000
+
+
+def _side_by_side_rows(old_text: str, new_text: str, context: int = _DIFF_CONTEXT_LINES,
+                       max_rows: int = _DIFF_MAX_ROWS) -> tuple:
+    """Build a side-by-side diff (old on the left, new on the right) as plain data.
+
+    Returns (rows, stats). Each row is a dict:
+      {"kind": "same"|"change", "old_no", "old", "old_mark", "new_no", "new", "new_mark"}
+    where *_no is the 1-based line number on that side (None when that side has no
+    line in this row), *_mark is "del" (line removed/changed on the old side), "add"
+    (line added/changed on the new side) or "" (unchanged), or a gap row
+      {"kind": "gap", "hidden": N}
+    standing for N unchanged lines that are not shown. Only the changed lines plus
+    `context` unchanged lines around them are returned, so a one-line change in a
+    3000-line config stays small. Changed blocks are paired line by line; the longer
+    side's extra lines sit opposite an empty cell. Presentation (HTML, colours) is the
+    caller's job. Lines are compared like _diff_lines (rstripped, blank lines kept).
+    stats = {"added", "removed", "truncated"}.
+    """
+    old = _diff_lines(old_text)
+    new = _diff_lines(new_text)
+    # default autojunk, like the unified diff above: autojunk=False took 7 s on a 4000-line config with
+    # 100 scattered edits (very repetitive lines) against 0.04 s, and gave the same blocks
+    ops = difflib.SequenceMatcher(None, old, new).get_opcodes()
+    rows, added, removed, truncated = [], 0, 0, False
+
+    def same_row(i, j):
+        return {"kind": "same", "old_no": i + 1, "old": old[i], "old_mark": "",
+                "new_no": j + 1, "new": new[j], "new_mark": ""}
+
+    for n, (tag, i1, i2, j1, j2) in enumerate(ops):
+        if tag == "equal":
+            size = i2 - i1
+            first, last = n == 0, n == len(ops) - 1
+            if first and last:
+                continue  # identical: no changes, no rows
+            head = 0 if first else context      # lines kept after the previous change
+            tail = 0 if last else context       # lines kept before the next change
+            if size <= head + tail:
+                rows += [same_row(i1 + k, j1 + k) for k in range(size)]
+            else:
+                rows += [same_row(i1 + k, j1 + k) for k in range(head)]
+                rows.append({"kind": "gap", "hidden": size - head - tail})
+                rows += [same_row(i2 - tail + k, j2 - tail + k) for k in range(tail)]
+            continue
+        removed += i2 - i1
+        added += j2 - j1
+        for k in range(max(i2 - i1, j2 - j1)):
+            has_old, has_new = i1 + k < i2, j1 + k < j2
+            rows.append({"kind": "change",
+                         "old_no": i1 + k + 1 if has_old else None, "old": old[i1 + k] if has_old else "",
+                         "old_mark": "del" if has_old else "",
+                         "new_no": j1 + k + 1 if has_new else None, "new": new[j1 + k] if has_new else "",
+                         "new_mark": "add" if has_new else ""})
+    if len(rows) > max_rows:
+        hidden = len(rows) - max_rows
+        rows = rows[:max_rows] + [{"kind": "gap", "hidden": hidden}]
+        truncated = True
+    return rows, {"added": added, "removed": removed, "truncated": truncated}
+
+
+def _start_background_render(conn, datastore: str = "running"):
+    """Render a datastore as CLI text in a SECOND, read-only NETCONF session on a
+    background thread, so the slow device-side render overlaps the staging work
+    done in the main session (lock, edit, validate, candidate render) instead of
+    running after it. get-modelled-config-clis on running needs no lock, so it
+    cannot collide with the candidate lock held by the main session.
+
+    Returns (thread, box). After thread.join(), box holds result/error (exactly
+    what _get_modelled_config_clis returned), exc (the exception if the second
+    session or the RPC failed; the caller then renders in its own session), and
+    seconds (how long the render took). The thread is a daemon so a main flow that
+    ends early never waits on it.
+    """
+    box = {"result": None, "error": None, "exc": None, "seconds": None}
+
+    def work():
+        started = time.monotonic()
+        try:
+            with _session(conn) as m2:
+                box["result"], box["error"] = _get_modelled_config_clis(m2, datastore)
+        except Exception as e:  # reported to the caller, which falls back to its own session
+            box["exc"] = e
+        box["seconds"] = round(time.monotonic() - started, 2)
+
+    thread = threading.Thread(target=work, name=f"render-{datastore}", daemon=True)
+    thread.start()
+    return thread, box
+
+
+def _preview_render(m, running_xml: str, candidate_after_xml: str, background=None) -> dict:
     """Produce the operator-facing diff, trying the device's own CLI
     renderer first and falling back to a structural XML diff of plain
     get-config output when get-modelled-config-clis isn't available.
 
     Returns preview_mode ("device-rendered" or "xml-diff") alongside diff,
-    has_changes, candidate_config, running_config, and render_warning —
-    always all present, so a caller never has to guess which rendering
-    produced the result.
+    diff_rows / diff_stats (the same diff as side-by-side data), has_changes,
+    candidate_config, running_config, render_warning and timings — always all
+    present, so a caller never has to guess which rendering produced the result.
+
+    With `background` (from _start_background_render: the running render already
+    in flight in its own session) the candidate render starts now and the two
+    overlap; without it they run one after the other in `m`. If the background
+    session failed, running is rendered in `m` after all (timings.parallel False).
     """
-    running_clis, running_render_err = _get_modelled_config_clis(m, "running")
-    if running_clis is not None:
+    render_started = time.monotonic()
+    timings = {"parallel": background is not None}
+    if background is not None:
+        # The running render has been going since before the staging work. Start the candidate
+        # render now; an unsupported RPC fails fast (unknown-element) and falls to the XML diff.
+        candidate_started = time.monotonic()
         candidate_clis, candidate_render_err = _get_modelled_config_clis(m, "candidate")
-        if candidate_clis is not None:
-            diff_text = "\n".join(difflib.unified_diff(
-                _diff_lines(running_clis), _diff_lines(candidate_clis),
-                fromfile="running", tofile="candidate", lineterm="",
-            ))
-            return {
-                "preview_mode": "device-rendered",
-                "diff": diff_text,
-                "has_changes": _normalize_text(running_clis) != _normalize_text(candidate_clis),
-                "candidate_config": candidate_clis or "",
-                "running_config": running_clis or "",
-                "render_warning": running_render_err or candidate_render_err,
-            }
+        timings["candidate_render_s"] = round(time.monotonic() - candidate_started, 2)
+        thread, box = background
+        thread.join()
+        timings["running_render_s"] = box["seconds"]
+        if box["exc"] is None:
+            running_clis, running_render_err = box["result"], box["error"]
+        else:
+            # the second session (or its RPC) failed: render running here, one after the other
+            timings["parallel"] = False
+            fallback_started = time.monotonic()
+            running_clis, running_render_err = _get_modelled_config_clis(m, "running")
+            timings["running_render_s"] = round(time.monotonic() - fallback_started, 2)
+        if running_clis is None:
+            candidate_clis = None
+    else:
+        running_started = time.monotonic()
+        running_clis, running_render_err = _get_modelled_config_clis(m, "running")
+        timings["running_render_s"] = round(time.monotonic() - running_started, 2)
+        candidate_clis, candidate_render_err = None, None
+        if running_clis is not None:
+            candidate_started = time.monotonic()
+            candidate_clis, candidate_render_err = _get_modelled_config_clis(m, "candidate")
+            timings["candidate_render_s"] = round(time.monotonic() - candidate_started, 2)
+    timings["render_wall_s"] = round(time.monotonic() - render_started, 2)
+    if running_clis is not None and candidate_clis is not None:
+        diff_text = "\n".join(difflib.unified_diff(
+            _diff_lines(running_clis), _diff_lines(candidate_clis),
+            fromfile="running", tofile="candidate", lineterm="",
+        ))
+        diff_rows, diff_stats = _side_by_side_rows(running_clis, candidate_clis)
+        return {
+            "preview_mode": "device-rendered",
+            "diff": diff_text,
+            "diff_rows": diff_rows,
+            "diff_stats": diff_stats,
+            "has_changes": _normalize_text(running_clis) != _normalize_text(candidate_clis),
+            "candidate_config": candidate_clis or "",
+            "running_config": running_clis or "",
+            "render_warning": running_render_err or candidate_render_err,
+            "timings": timings,
+        }
 
     diff_text = "\n".join(difflib.unified_diff(
         _diff_lines(running_xml), _diff_lines(candidate_after_xml),
         fromfile="running", tofile="candidate", lineterm="",
     ))
+    diff_rows, diff_stats = _side_by_side_rows(running_xml, candidate_after_xml)
     return {
         "preview_mode": "xml-diff",
         "diff": diff_text,
+        "diff_rows": diff_rows,
+        "diff_stats": diff_stats,
         "has_changes": _normalize_text(running_xml) != _normalize_text(candidate_after_xml),
         "candidate_config": candidate_after_xml or "",
         "running_config": running_xml or "",
         "render_warning": None,
+        "timings": timings,
     }
 
 
@@ -398,7 +532,9 @@ def preview_config(conn, args) -> dict:
     edit_config with the caller's config_xml -> validate (capability-gated,
     captured not raised) -> re-get-config(candidate) -> render/diff (device
     CLI render if available, else XML diff) -> discard_changes + unlock in
-    a finally, discarding only if we actually edited.
+    a finally, discarding only if we actually edited. The CLI render of
+    running starts in a second session just before the lock, so it overlaps
+    the staging work and the candidate render (see timings in the result).
 
     The dirty check runs BEFORE the lock, not after. A dirty candidate is
     exactly what makes lock(candidate) fail (operation-failed / "there are
@@ -465,6 +601,10 @@ def preview_config(conn, args) -> dict:
 
             running_hash = _text_hash(running_xml)
 
+            # The CLI render of RUNNING is the slowest step and needs neither the lock nor the edit,
+            # so it runs in a second read-only session while this session stages the change.
+            background = _start_background_render(conn, "running")
+
             lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
             edited = False
             try:
@@ -486,9 +626,11 @@ def preview_config(conn, args) -> dict:
                     valid, validate_result = None, "unsupported"
 
                 candidate_after_xml = _get_config_xml(m, "candidate")
-                render = _preview_render(m, running_xml, candidate_after_xml)
+                render = _preview_render(m, running_xml, candidate_after_xml, background)
                 if not include_diff:
                     render["diff"] = None
+                    render["diff_rows"] = None
+                    render["diff_stats"] = None
 
                 return {
                     "success": True,
@@ -499,11 +641,16 @@ def preview_config(conn, args) -> dict:
                     "validate": validate_result,
                     "preview_mode": render["preview_mode"],
                     "diff": render["diff"],
+                    # the same diff as plain data for a side-by-side view: changed lines + context
+                    "diff_rows": render["diff_rows"],
+                    "diff_stats": render["diff_stats"],
                     "has_changes": render["has_changes"],
                     "candidate_config": render["candidate_config"],
                     "running_config": render["running_config"],
                     "running_hash": running_hash,
                     "warning": render["render_warning"],
+                    # how long each CLI render took and whether the two ran at the same time
+                    "timings": render["timings"],
                     "committed": False,
                 }
             finally:

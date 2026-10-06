@@ -79,6 +79,27 @@ never guessed:
 Both modes run the identical lock/edit/validate/discard sequence — only the render-and-diff
 step differs. An operator approving a change needs to know which one they're looking at.
 
+### Side-by-side diff data and render timing
+
+Besides the unified `diff` text, the preview result carries the same diff as plain data for a
+side-by-side view (old on the left, new on the right):
+
+- `diff_rows`: a list of rows. `{"kind": "same" | "change", "old_no", "old", "old_mark", "new_no", "new", "new_mark"}`
+  where `*_no` is the 1-based line number on that side (`null` when that side has no line in the row)
+  and `*_mark` is `"del"` (removed or changed on the old side), `"add"` (added or changed on the new
+  side) or `""`; or `{"kind": "gap", "hidden": N}` for N unchanged lines that are not shown. Only the
+  changed lines plus 3 lines of context are returned, capped at 5000 rows. Changed blocks are paired line
+  by line. Text is raw, not HTML-escaped: escaping is the job of whoever draws it.
+- `diff_stats`: `{"added", "removed", "truncated"}`.
+- `timings`: `running_render_s`, `candidate_render_s`, `render_wall_s` and `parallel`. The CLI render of
+  running (the slow step) runs in a second read-only NETCONF session while the main session locks,
+  edits, validates and renders candidate, so the two renders overlap. If the second session cannot be
+  opened or fails, running is rendered in the main session afterwards and `parallel` is `false`.
+  Whether the device really runs the two renders at the same time (and so how much time this saves)
+  is read off `timings` on a live run; it has not been measured on a CAT 9500 yet.
+
+`diff: false` drops `diff`, `diff_rows` and `diff_stats`.
+
 **Unverified, TODO — do not assume:**
 - Whether `Cisco-IOS-XE-cli-rpc` is present on 17.12.4, and at which revision.
 - Whether `get-modelled-config-clis` exists on IE 3400 / IE 3500 at 17.15.5 (confirmed on
@@ -156,8 +177,9 @@ CLI flags win over stdin values when both are present.
 python -m unittest test_main -v
 ```
 
-Offline, no device needed — covers text normalization/hashing, capability parsing, and
-`preview_mode` selection (including the XML-diff fallback).
+Offline, no device needed — covers text normalization/hashing, capability parsing,
+`preview_mode` selection (including the XML-diff fallback), the side-by-side diff rows, and the
+parallel render with its fallbacks.
 
 ## Recommended inventory attributes
 
