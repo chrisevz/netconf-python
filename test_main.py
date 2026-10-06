@@ -128,6 +128,27 @@ class PreviewRenderTests(unittest.TestCase):
         self.assertTrue(result["has_changes"])
         self.assertNotEqual(result["diff"], "")
 
+    def test_candidate_xml_reader_is_not_called_when_the_device_renders(self):
+        m = MagicMock()
+        m.dispatch.side_effect = [
+            self._fake_reply("running config text\n"),
+            self._fake_reply("candidate config text\n"),
+        ]
+        reader = MagicMock(return_value="<candidate/>")
+        result = main._preview_render(m, "<running/>", reader)
+        self.assertEqual(result["preview_mode"], "device-rendered")
+        reader.assert_not_called()
+
+    def test_candidate_xml_reader_is_called_once_by_the_xml_diff_fallback(self):
+        m = MagicMock()
+        m.dispatch.side_effect = _make_rpc_error()
+        reader = MagicMock(return_value="<config><a>2</a></config>")
+        result = main._preview_render(m, "<config><a>1</a></config>", reader)
+        reader.assert_called_once_with()
+        self.assertEqual(result["preview_mode"], "xml-diff")
+        self.assertEqual(result["candidate_config"], "<config><a>2</a></config>")
+        self.assertTrue(result["has_changes"])
+
     @staticmethod
     def _fake_reply(cli_text):
         reply = MagicMock()
@@ -293,23 +314,29 @@ class ParallelRenderTests(unittest.TestCase):
 class PreviewConfigFlowTests(unittest.TestCase):
     """preview_config end to end with a mocked manager: ordering and result shape."""
 
-    def _run(self, diff=True):
+    def _run(self, diff=True, render_supported=True):
         m = MagicMock()
         m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0"]
-        m.dispatch.side_effect = [PreviewRenderTests._fake_reply("hostname a\ndescription new\n")]
-        session = MagicMock()
-        session.__enter__.return_value = m
         order = MagicMock()
         thread = MagicMock()
-        box = {"result": "hostname a\ndescription old\n", "error": None, "exc": None, "seconds": 2.0}
+        if render_supported:
+            m.dispatch.side_effect = [PreviewRenderTests._fake_reply("hostname a\ndescription new\n")]
+            box = {"result": "hostname a\ndescription old\n", "error": None, "exc": None, "seconds": 2.0}
+        else:
+            m.dispatch.side_effect = _make_rpc_error()
+            box = {"result": None, "error": "get-modelled-config-clis RPC not supported", "exc": None,
+                   "seconds": 0.1}
+        session = MagicMock()
+        session.__enter__.return_value = m
         order.start.return_value = (thread, box)
         order.lock.return_value = 0.0
+        order.read.side_effect = ["<a>1</a>", "<a>1</a>", "<a>2</a>"]
         conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
         args = MagicMock(config_xml="<config/>", force_discard=False, diff=diff)
         with patch.object(main, "_session", return_value=session), \
              patch.object(main, "_start_background_render", order.start), \
              patch.object(main, "_acquire_candidate_lock", order.lock), \
-             patch.object(main, "_get_config_xml", side_effect=["<a>1</a>", "<a>1</a>", "<a>2</a>"]):
+             patch.object(main, "_get_config_xml", order.read):
             result = main.preview_config(conn, args)
         return result, order, m
 
@@ -321,6 +348,28 @@ class PreviewConfigFlowTests(unittest.TestCase):
         order.start.assert_called_once_with({"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1},
                                             "running")
 
+    def test_background_render_starts_before_the_slow_xml_reads(self):
+        _, order, _ = self._run()
+        names = [c[0] for c in order.mock_calls if c[0] in ("start", "read", "lock")]
+        self.assertEqual(names, ["start", "read", "read", "lock"])
+
+    def test_device_rendered_mode_never_reads_candidate_xml_after_the_edit(self):
+        result, order, _ = self._run()
+        self.assertEqual(result["preview_mode"], "device-rendered")
+        self.assertEqual([c.args[1] for c in order.read.call_args_list], ["running", "candidate"])
+        self.assertNotIn("get_candidate_xml_after_edit", result["timings"]["steps"])
+
+    def test_xml_diff_fallback_reads_candidate_xml_after_the_edit(self):
+        result, order, m = self._run(render_supported=False)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["preview_mode"], "xml-diff")
+        self.assertEqual([c.args[1] for c in order.read.call_args_list], ["running", "candidate", "candidate"])
+        self.assertIn("get_candidate_xml_after_edit", result["timings"]["steps"])
+        self.assertTrue(result["has_changes"])
+        self.assertTrue(result["diff_rows"])
+        m.discard_changes.assert_called()
+        m.unlock.assert_called_once_with(target="candidate")
+
     def test_result_carries_side_by_side_rows_stats_and_timings(self):
         result, _, m = self._run()
         self.assertEqual(result["preview_mode"], "device-rendered")
@@ -331,7 +380,7 @@ class PreviewConfigFlowTests(unittest.TestCase):
         self.assertTrue(result["timings"]["parallel"])
         steps = result["timings"]["steps"]
         for name in ("connect", "get_running_xml", "get_candidate_xml", "lock", "edit_config", "validate",
-                     "get_candidate_xml_after_edit", "render", "discard_unlock"):
+                     "render", "discard_unlock"):
             self.assertIn(name, steps)
         self.assertGreaterEqual(result["timings"]["driver_total_s"], 0)
         self.assertFalse(result["committed"])

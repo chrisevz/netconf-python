@@ -361,6 +361,10 @@ class _Steps:
         self.laps[name] = round(now - self.last, 2)
         self.last = now
 
+    def record(self, name: str, seconds: float) -> None:
+        """Add a phase that ran inside another lap (its time is part of that lap too)."""
+        self.laps[name] = round(seconds, 2)
+
     def total(self) -> float:
         return round(time.monotonic() - self.start, 2)
 
@@ -471,6 +475,11 @@ def _preview_render(m, running_xml: str, candidate_after_xml: str, background=No
     in flight in its own session) the candidate render starts now and the two
     overlap; without it they run one after the other in `m`. If the background
     session failed, running is rendered in `m` after all (timings.parallel False).
+
+    `candidate_after_xml` is the candidate XML after the edit, or a zero-argument
+    callable that reads it. Only the XML-diff fallback needs it, and a plain
+    get-config of a large stack config is slow (about 75 s on a two-member C9500
+    stack), so the device-rendered path never calls the reader.
     """
     render_started = time.monotonic()
     timings = {"parallel": background is not None}
@@ -521,6 +530,8 @@ def _preview_render(m, running_xml: str, candidate_after_xml: str, background=No
             "timings": timings,
         }
 
+    if callable(candidate_after_xml):
+        candidate_after_xml = candidate_after_xml()
     diff_text = "\n".join(difflib.unified_diff(
         _diff_lines(running_xml), _diff_lines(candidate_after_xml),
         fromfile="running", tofile="candidate", lineterm="",
@@ -548,11 +559,14 @@ def preview_config(conn, args) -> dict:
     uncommitted work there — refuse with a dirty_diff unless force_discard,
     in which case discard it, no lock needed) -> lock candidate ->
     edit_config with the caller's config_xml -> validate (capability-gated,
-    captured not raised) -> re-get-config(candidate) -> render/diff (device
-    CLI render if available, else XML diff) -> discard_changes + unlock in
-    a finally, discarding only if we actually edited. The CLI render of
-    running starts in a second session just before the lock, so it overlaps
-    the staging work and the candidate render (see timings in the result).
+    captured not raised) -> render/diff (device CLI render if available;
+    else XML diff, which is the only case that re-reads candidate with
+    get-config) -> discard_changes + unlock in a finally, discarding only if
+    we actually edited. The CLI render of running starts in a second
+    session right after the candidate-capability check, so it runs while
+    the slow get-config reads and the staging work happen (see timings in
+    the result). If the dirty check refuses, that render is abandoned (daemon
+    thread, ends with the process).
 
     The dirty check runs BEFORE the lock, not after. A dirty candidate is
     exactly what makes lock(candidate) fail (operation-failed / "there are
@@ -592,6 +606,11 @@ def preview_config(conn, args) -> dict:
                 return {"success": False, "host": conn["host"], "device_name": device_name,
                         "error": "device has no candidate datastore — netconf-preview-config requires it"}
 
+            # The CLI render of RUNNING is the slowest device-side step and needs neither the lock nor the
+            # edit, so it runs in a second read-only session from the start, hidden behind the two plain
+            # get-config reads below (measured on a C9500 stack: ~36 s render, ~120 s of reads).
+            background = _start_background_render(conn, "running")
+
             running_xml = _get_config_xml(m, "running")
             steps.lap("get_running_xml")
             candidate_before_xml = _get_config_xml(m, "candidate")
@@ -623,10 +642,6 @@ def preview_config(conn, args) -> dict:
 
             running_hash = _text_hash(running_xml)
 
-            # The CLI render of RUNNING is the slowest step and needs neither the lock nor the edit,
-            # so it runs in a second read-only session while this session stages the change.
-            background = _start_background_render(conn, "running")
-
             lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
             steps.lap("lock")
             edited = False
@@ -651,9 +666,14 @@ def preview_config(conn, args) -> dict:
                     valid, validate_result = None, "unsupported"
                 steps.lap("validate")
 
-                candidate_after_xml = _get_config_xml(m, "candidate")
-                steps.lap("get_candidate_xml_after_edit")
-                render = _preview_render(m, running_xml, candidate_after_xml, background)
+                def read_candidate_xml():
+                    # only called by the XML-diff fallback; inside the render lap, so timed on its own
+                    started = time.monotonic()
+                    xml = _get_config_xml(m, "candidate")
+                    steps.record("get_candidate_xml_after_edit", time.monotonic() - started)
+                    return xml
+
+                render = _preview_render(m, running_xml, read_candidate_xml, background)
                 steps.lap("render")
                 if not include_diff:
                     render["diff"] = None

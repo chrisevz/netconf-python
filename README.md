@@ -91,11 +91,16 @@ side-by-side view (old on the left, new on the right):
   changed lines plus 3 lines of context are returned, capped at 5000 rows. Changed blocks are paired line
   by line. Text is raw, not HTML-escaped: escaping is the job of whoever draws it.
 - `diff_stats`: `{"added", "removed", "truncated"}`.
-- `timings`: `running_render_s`, `candidate_render_s`, `render_wall_s` (time the main session spent in the render step: the candidate render plus any wait for the running render; equal to the candidate render when the running render had already finished), `parallel`, `steps` (seconds per phase: `connect`, `get_running_xml`, `get_candidate_xml`, `lock`, `edit_config`, `validate`, `get_candidate_xml_after_edit`, `render`, `discard_unlock`) and `driver_total_s` (the script's own total, to compare with the task time in the workflow). The CLI render of
-  running (the slow step) runs in a second read-only NETCONF session while the main session locks,
-  edits, validates and renders candidate, so the two renders overlap. If the second session cannot be
-  opened or fails, running is rendered in the main session afterwards and `parallel` is `false`.
-  First live run on a Catalyst 9500 stack (10-06): `parallel` true, running render 36 s, candidate render 22 s, but the whole preview still took ~222 s, so the CLI renders are NOT the main cost; `steps` exists to find what is.
+- `timings`: `running_render_s`, `candidate_render_s`, `render_wall_s` (time the main session spent in the render step: the candidate render plus any wait for the running render; equal to the candidate render when the running render had already finished), `parallel`, `steps` (seconds per phase: `connect`, `get_running_xml`, `get_candidate_xml`, `lock`, `edit_config`, `validate`, `render`, `discard_unlock`; plus `get_candidate_xml_after_edit`, which only appears in `"xml-diff"` mode and is already part of the `render` time) and `driver_total_s` (the script's own total, to compare with the task time in the workflow). The CLI render of
+  running (a slow step) runs in a second read-only NETCONF session that starts right after the candidate
+  capability check, so it overlaps the two plain `get-config` reads and the staging work; the candidate
+  render follows the edit. If the second session cannot be opened or fails, running is rendered in the
+  main session afterwards and `parallel` is `false`.
+  Live measurement on a Catalyst 9500 stack (10-06, before this ordering): 220 s in total, of which the three
+  plain `get-config` reads took 195 s (running 47 s, candidate 74 s, candidate after the edit 74.5 s), the wait
+  for the CLI render 22 s (the running render of 36 s had already finished) and everything else 3 s. The
+  post-edit candidate read is now done only in `"xml-diff"` mode, and the running render starts earlier; not
+  yet measured live.
 
 `diff: false` drops `diff`, `diff_rows` and `diff_stats`.
 
