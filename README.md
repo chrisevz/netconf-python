@@ -91,12 +91,11 @@ side-by-side view (old on the left, new on the right):
   changed lines plus 3 lines of context are returned, capped at 5000 rows. Changed blocks are paired line
   by line. Text is raw, not HTML-escaped: escaping is the job of whoever draws it.
 - `diff_stats`: `{"added", "removed", "truncated"}`.
-- `timings`: `running_render_s`, `candidate_render_s`, `render_wall_s` and `parallel`. The CLI render of
+- `timings`: `running_render_s`, `candidate_render_s`, `render_wall_s` (time the main session spent in the render step: the candidate render plus any wait for the running render; equal to the candidate render when the running render had already finished), `parallel`, `steps` (seconds per phase: `connect`, `get_running_xml`, `get_candidate_xml`, `lock`, `edit_config`, `validate`, `get_candidate_xml_after_edit`, `render`, `discard_unlock`) and `driver_total_s` (the script's own total, to compare with the task time in the workflow). The CLI render of
   running (the slow step) runs in a second read-only NETCONF session while the main session locks,
   edits, validates and renders candidate, so the two renders overlap. If the second session cannot be
   opened or fails, running is rendered in the main session afterwards and `parallel` is `false`.
-  Whether the device really runs the two renders at the same time (and so how much time this saves)
-  is read off `timings` on a live run; it has not been measured on a CAT 9500 yet.
+  First live run on a Catalyst 9500 stack (10-06): `parallel` true, running render 36 s, candidate render 22 s, but the whole preview still took ~222 s, so the CLI renders are NOT the main cost; `steps` exists to find what is.
 
 `diff: false` drops `diff`, `diff_rows` and `diff_stats`.
 

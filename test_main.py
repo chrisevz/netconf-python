@@ -329,6 +329,11 @@ class PreviewConfigFlowTests(unittest.TestCase):
         self.assertEqual([(r["old"], r["new"]) for r in changes], [("description old", "description new")])
         self.assertEqual(result["diff_stats"]["added"], 1)
         self.assertTrue(result["timings"]["parallel"])
+        steps = result["timings"]["steps"]
+        for name in ("connect", "get_running_xml", "get_candidate_xml", "lock", "edit_config", "validate",
+                     "get_candidate_xml_after_edit", "render", "discard_unlock"):
+            self.assertIn(name, steps)
+        self.assertGreaterEqual(result["timings"]["driver_total_s"], 0)
         self.assertFalse(result["committed"])
         m.discard_changes.assert_called()
         m.unlock.assert_called_once_with(target="candidate")

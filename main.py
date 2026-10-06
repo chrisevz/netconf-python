@@ -347,6 +347,24 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256(_normalize_text(text).encode("utf-8")).hexdigest()[:16]
 
 
+class _Steps:
+    """Wall-clock laps of one preview, reported as timings.steps / timings.driver_total_s so a live
+    run shows where the time goes (the 10-06 live run took ~222 s while the two CLI renders added up to
+    only 22 s + 36 s)."""
+
+    def __init__(self):
+        self.start = self.last = time.monotonic()
+        self.laps = {}
+
+    def lap(self, name: str) -> None:
+        now = time.monotonic()
+        self.laps[name] = round(now - self.last, 2)
+        self.last = now
+
+    def total(self) -> float:
+        return round(time.monotonic() - self.start, 2)
+
+
 _DIFF_CONTEXT_LINES = 3
 _DIFF_MAX_ROWS = 5000
 
@@ -565,15 +583,19 @@ def preview_config(conn, args) -> dict:
 
     force_discard = getattr(args, "force_discard", False)
     include_diff = getattr(args, "diff", True)
+    steps = _Steps()
 
     try:
         with _session(conn) as m:
+            steps.lap("connect")
             if not _has_candidate(m):
                 return {"success": False, "host": conn["host"], "device_name": device_name,
                         "error": "device has no candidate datastore — netconf-preview-config requires it"}
 
             running_xml = _get_config_xml(m, "running")
+            steps.lap("get_running_xml")
             candidate_before_xml = _get_config_xml(m, "candidate")
+            steps.lap("get_candidate_xml")
 
             if _normalize_text(running_xml) != _normalize_text(candidate_before_xml):
                 if not force_discard:
@@ -606,13 +628,16 @@ def preview_config(conn, args) -> dict:
             background = _start_background_render(conn, "running")
 
             lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
+            steps.lap("lock")
             edited = False
+            result = None
             try:
                 # Set before the call, not after: a raising edit_config may have
                 # partially applied. The discard in the finally is most needed on
                 # exactly that path.
                 edited = True
                 m.edit_config(target="candidate", config=config_xml)
+                steps.lap("edit_config")
 
                 if _has_validate(m):
                     try:
@@ -624,15 +649,18 @@ def preview_config(conn, args) -> dict:
                     # Distinct from both "valid" and an actual validation error —
                     # a device without :validate isn't invalid, it just can't tell us.
                     valid, validate_result = None, "unsupported"
+                steps.lap("validate")
 
                 candidate_after_xml = _get_config_xml(m, "candidate")
+                steps.lap("get_candidate_xml_after_edit")
                 render = _preview_render(m, running_xml, candidate_after_xml, background)
+                steps.lap("render")
                 if not include_diff:
                     render["diff"] = None
                     render["diff_rows"] = None
                     render["diff_stats"] = None
 
-                return {
+                result = {
                     "success": True,
                     "host": conn["host"],
                     "device_name": device_name,
@@ -649,10 +677,12 @@ def preview_config(conn, args) -> dict:
                     "running_config": render["running_config"],
                     "running_hash": running_hash,
                     "warning": render["render_warning"],
-                    # how long each CLI render took and whether the two ran at the same time
-                    "timings": render["timings"],
+                    # how long each CLI render took and whether the two ran at the same time, plus where
+                    # the whole call spent its time (steps) and the driver's own total in seconds
+                    "timings": dict(render["timings"], steps=steps.laps, driver_total_s=steps.total()),
                     "committed": False,
                 }
+                return result
             finally:
                 try:
                     if edited:
@@ -663,6 +693,10 @@ def preview_config(conn, args) -> dict:
                     m.unlock(target="candidate")
                 except Exception:
                     pass
+                if result is not None:
+                    # the result dict is already on its way out; the cleanup lap is added to it here
+                    steps.lap("discard_unlock")
+                    result["timings"]["driver_total_s"] = steps.total()
     except RPCError as e:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "committed": False,
