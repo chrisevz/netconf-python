@@ -347,6 +347,24 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256(_normalize_text(text).encode("utf-8")).hexdigest()[:16]
 
 
+_SECRET_PLACEHOLDER = "GATEWAYSECRET_"
+
+
+def _unresolved_secret_placeholder(config_xml, conn, device_name):
+    """Failure result when config_xml still carries a $GATEWAYSECRET_(name) placeholder, else None.
+
+    The gateway swaps each placeholder for the real secret before this process starts, and refuses the whole
+    call when a name does not exist. A placeholder that still reaches the driver was therefore not swapped (a
+    malformed one, for example), and sending it would set the literal text as the password or key on the
+    device. Refuse before any session is opened. The error never echoes config_xml: it may hold other secrets."""
+    if _SECRET_PLACEHOLDER not in config_xml:
+        return None
+    return {"success": False, "host": conn["host"], "device_name": device_name,
+            "error": "config_xml still contains a $GATEWAYSECRET_ placeholder: the gateway did not substitute "
+                     "it, so it would reach the device as literal text. Nothing was sent to the device.",
+            "error_type": "UnresolvedSecretPlaceholder", "committed": False}
+
+
 class _Steps:
     """Wall-clock laps of one preview, reported as timings.steps / timings.driver_total_s so a live
     run shows where the time goes (the 10-06 live run took ~222 s while the two CLI renders added up to
@@ -594,6 +612,9 @@ def preview_config(conn, args) -> dict:
     if not config_xml:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "error": "config_xml is required for action=netconf-preview-config"}
+    unresolved = _unresolved_secret_placeholder(config_xml, conn, device_name)
+    if unresolved:
+        return unresolved
 
     force_discard = getattr(args, "force_discard", False)
     include_diff = getattr(args, "diff", True)
@@ -753,6 +774,9 @@ def send_command(conn, args) -> dict:
     if not config_xml:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "error": "config_xml is required for action=netconf-send-command"}
+    unresolved = _unresolved_secret_placeholder(config_xml, conn, device_name)
+    if unresolved:
+        return unresolved
     expect_running_hash = getattr(args, "expect_running_hash", None)
     confirm_timeout = getattr(args, "confirm_timeout", None)
     persist_id = uuid.uuid4().hex if confirm_timeout else None

@@ -494,6 +494,44 @@ class SendConfigXmlTests(unittest.TestCase):
         m.unlock.assert_called_once_with(target="candidate")
 
 
+class UnresolvedSecretPlaceholderTests(unittest.TestCase):
+    """The gateway swaps $GATEWAYSECRET_(name) for the real value before the driver runs. A placeholder that
+    still reaches the driver was not swapped: it must never be sent on, where it would become the literal
+    password or key on the device."""
+
+    XML = "<config><key>$GATEWAYSECRET_(example-name)</key><other>keep-out-of-errors</other></config>"
+    CONN = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+
+    def test_preview_refuses_before_opening_a_session(self):
+        args = MagicMock(config_xml=self.XML, force_discard=False, diff=True)
+        with patch.object(main, "_session") as session:
+            result = main.preview_config(self.CONN, args)
+        session.assert_not_called()
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "UnresolvedSecretPlaceholder")
+        self.assertFalse(result["committed"])
+
+    def test_push_refuses_before_opening_a_session(self):
+        args = MagicMock(config_xml=self.XML, expect_running_hash=None, confirm_timeout=600)
+        with patch.object(main, "_session") as session:
+            result = main.send_command(self.CONN, args)
+        session.assert_not_called()
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "UnresolvedSecretPlaceholder")
+        self.assertFalse(result["committed"])
+
+    def test_the_error_does_not_echo_the_config(self):
+        args = MagicMock(config_xml=self.XML, force_discard=False, diff=True)
+        with patch.object(main, "_session"):
+            result = main.preview_config(self.CONN, args)
+        text = json.dumps(result)
+        self.assertNotIn("example-name", text)
+        self.assertNotIn("keep-out-of-errors", text)
+
+    def test_a_config_without_a_placeholder_is_not_refused(self):
+        self.assertIsNone(main._unresolved_secret_placeholder("<config><a>1</a></config>", self.CONN, "dev"))
+
+
 class ConfirmAndCancelCommitTests(unittest.TestCase):
     CONFIRMED_1_1 = "urn:ietf:params:netconf:capability:confirmed-commit:1.1"
 
