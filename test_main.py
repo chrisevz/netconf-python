@@ -590,6 +590,10 @@ class ConfirmAndCancelCommitTests(unittest.TestCase):
         self.assertFalse(result["rolled_back"])
 
 
+IOSXE_CAP = "http://cisco.com/ns/yang/Cisco-IOS-XE-native?module=Cisco-IOS-XE-native&revision=2024-01-01"
+NXOS_CAP = "http://cisco.com/ns/yang/cisco-nx-os-device?module=cisco-nx-os-device&revision=2024-01-01"
+
+
 class IsAliveCapabilityTests(unittest.TestCase):
     def _run(self, capabilities):
         m = MagicMock()
@@ -602,7 +606,7 @@ class IsAliveCapabilityTests(unittest.TestCase):
             return main.is_alive({"host": "10.0.0.1"}, MagicMock())
 
     def test_reports_persistent_confirmed_commit_when_advertised(self):
-        result = self._run(["urn:ietf:params:netconf:capability:confirmed-commit:1.1"])
+        result = self._run([IOSXE_CAP, "urn:ietf:params:netconf:capability:confirmed-commit:1.1"])
         self.assertTrue(result["alive"])
         self.assertEqual(result["output"], "17.15")
         self.assertTrue(result["persist_confirmed_commit"])
@@ -610,6 +614,81 @@ class IsAliveCapabilityTests(unittest.TestCase):
     def test_reports_false_for_1_0_only_or_absent(self):
         self.assertFalse(self._run(["urn:ietf:params:netconf:capability:confirmed-commit:1.0"])["persist_confirmed_commit"])
         self.assertFalse(self._run([])["persist_confirmed_commit"])
+
+
+class IsAlivePlatformTests(unittest.TestCase):
+    NXOS_REPLY = ('<data><System xmlns="http://cisco.com/ns/yang/cisco-nx-os-device"><showversion-items>'
+                  '<nxosVersion>10.5(5)</nxosVersion></showversion-items></System></data>')
+    IOSXE_REPLY = ('<data><native xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-native">'
+                   '<version>17.15</version></native></data>')
+
+    def _run(self, capabilities, reply=None, error=None):
+        m = MagicMock()
+        m.server_capabilities = capabilities
+        if error is not None:
+            m.get.side_effect = error
+        else:
+            m.get.return_value.data_xml = reply
+        session = MagicMock()
+        session.__enter__.return_value = m
+        with patch.object(main, "_session", return_value=session):
+            return main.is_alive({"host": "10.0.0.1"}, MagicMock()), m
+
+    def test_nxos_reads_version_from_showversion(self):
+        result, m = self._run([NXOS_CAP], self.NXOS_REPLY)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["platform"], "nxos")
+        self.assertEqual(result["output"], "10.5(5)")
+        self.assertNotIn("version_error", result)
+        self.assertIn("nxosVersion", m.get.call_args.kwargs["filter"][1])
+
+    def test_iosxe_platform_and_version(self):
+        result, _ = self._run([IOSXE_CAP], self.IOSXE_REPLY)
+        self.assertEqual(result["platform"], "iosxe")
+        self.assertEqual(result["output"], "17.15")
+
+    def test_unknown_platform_skips_version_read(self):
+        result, m = self._run(["urn:ietf:params:netconf:base:1.1"])
+        self.assertTrue(result["alive"])
+        self.assertEqual(result["platform"], "unknown")
+        self.assertEqual(result["output"], "")
+        self.assertNotIn("version_error", result)
+        m.get.assert_not_called()
+
+    def test_version_rpc_error_still_alive_on_both_platforms(self):
+        for cap, platform in ((IOSXE_CAP, "iosxe"), (NXOS_CAP, "nxos")):
+            result, _ = self._run([cap], error=_make_rpc_error("unknown-namespace"))
+            self.assertTrue(result["success"])
+            self.assertTrue(result["alive"])
+            self.assertEqual(result["platform"], platform)
+            self.assertEqual(result["output"], "")
+            self.assertIn("version_error", result)
+
+    def test_version_parse_error_still_alive(self):
+        result, _ = self._run([NXOS_CAP], "not xml")
+        self.assertTrue(result["alive"])
+        self.assertIn("version_error", result)
+
+    def test_capabilities_and_base_capabilities(self):
+        base = "urn:ietf:params:netconf:base:1.1"
+        caps = [NXOS_CAP, "urn:ietf:params:netconf:capability:validate:1.1",
+                "urn:ietf:params:netconf:capability:candidate:1.0",
+                "urn:ietf:params:netconf:capability:confirmed-commit:1.0",
+                "urn:ietf:params:netconf:capability:startup:1.0", base]
+        result, _ = self._run(caps, self.NXOS_REPLY)
+        self.assertEqual(result["capabilities"], {
+            "candidate": True, "validate": True,
+            "confirmed_commit_1_0": True, "confirmed_commit_1_1": False,
+            "writable_running": False, "rollback_on_error": False, "startup": True})
+        self.assertFalse(result["persist_confirmed_commit"])
+        self.assertEqual(result["base_capabilities"], sorted(c for c in caps if c.startswith("urn:")))
+        self.assertNotIn(NXOS_CAP, result["base_capabilities"])
+
+    def test_capabilities_confirmed_1_1_matches_persist(self):
+        result, _ = self._run(["urn:ietf:params:netconf:capability:confirmed-commit:1.1"])
+        self.assertTrue(result["capabilities"]["confirmed_commit_1_1"])
+        self.assertTrue(result["persist_confirmed_commit"])
+        self.assertFalse(result["capabilities"]["confirmed_commit_1_0"])
 
 
 class NormalizeArgsTests(unittest.TestCase):

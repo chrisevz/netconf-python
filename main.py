@@ -223,22 +223,56 @@ def _get_modelled_config_clis(m, datastore: str = "running"):
     return result, error
 
 
+def _detect_platform(m) -> str:
+    """"nxos", "iosxe" or "unknown", from the YANG modules the server
+    advertises. NX-OS is checked first; the two never overlap in practice."""
+    caps = [str(cap) for cap in m.server_capabilities]
+    if any("http://cisco.com/ns/yang/cisco-nx-os-device" in cap for cap in caps):
+        return "nxos"
+    if any("http://cisco.com/ns/yang/Cisco-IOS-XE-native" in cap for cap in caps):
+        return "iosxe"
+    return "unknown"
+
+
+_VERSION_READS = {
+    "iosxe": ("version",
+              "<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><version/></native>"),
+    "nxos": ("nxosVersion",
+             "<System xmlns=\"http://cisco.com/ns/yang/cisco-nx-os-device\">"
+             "<showversion-items><nxosVersion/></showversion-items></System>"),
+}
+
+
+def _read_version(m, platform: str) -> str:
+    """Read the software version with the platform's own subtree filter.
+    Raises on any failure; the caller decides that a failed read must not
+    fail the liveness check."""
+    local_name, filter_xml = _VERSION_READS[platform]
+    reply = m.get(filter=("subtree", filter_xml))
+    xml_str = reply.data_xml if hasattr(reply, "data_xml") else str(reply)
+    tree = _etree.fromstring(xml_str.encode() if isinstance(xml_str, str) else xml_str)
+    nodes = tree.xpath(f".//*[local-name()='{local_name}']")
+    return nodes[0].text.strip() if nodes and nodes[0].text else ""
+
+
 def is_alive(conn, args) -> dict:
     device_name = conn.get("device_name") or conn["host"]
     try:
         with _session(conn) as m:
+            platform = _detect_platform(m)
             version = ""
-            reply = m.get(filter=("subtree",
-                "<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><version/></native>"
-            ))
-            try:
-                xml_str = reply.data_xml if hasattr(reply, "data_xml") else str(reply)
-                tree = _etree.fromstring(xml_str.encode() if isinstance(xml_str, str) else xml_str)
-                nodes = tree.xpath(".//*[local-name()='version']")
-                version = nodes[0].text.strip() if nodes and nodes[0].text else ""
-            except Exception:
-                pass
-            return {
+            version_error = None
+            # Opening the session is the liveness proof; a failed version read
+            # (wrong model for this platform, RPCError, bad XML) is reported
+            # but never turns the result into alive:false.
+            if platform in _VERSION_READS:
+                try:
+                    version = _read_version(m, platform)
+                except Exception as e:
+                    version = ""
+                    version_error = str(e)[:200]
+            confirmed_1_1 = _has_persistent_confirmed_commit(m)
+            result = {
                 "success": True,
                 "alive": True,
                 "host": conn["host"],
@@ -246,8 +280,27 @@ def is_alive(conn, args) -> dict:
                 "output": version,
                 # Lets a workflow refuse a device that cannot do a persistent
                 # confirmed commit before any operator time is spent.
-                "persist_confirmed_commit": _has_persistent_confirmed_commit(m),
+                "persist_confirmed_commit": confirmed_1_1,
+                "platform": platform,
+                "capabilities": {
+                    "candidate": _has_capability(m, "candidate"),
+                    "validate": _has_capability(m, "validate"),
+                    "confirmed_commit_1_0": any(
+                        str(cap).startswith("urn:ietf:params:netconf:capability:confirmed-commit:1.0")
+                        for cap in m.server_capabilities),
+                    "confirmed_commit_1_1": confirmed_1_1,
+                    "writable_running": _has_capability(m, "writable-running"),
+                    "rollback_on_error": _has_capability(m, "rollback-on-error"),
+                    "startup": _has_capability(m, "startup"),
+                },
+                # Base protocol capabilities only; the YANG module list is huge on NX-OS.
+                "base_capabilities": sorted(
+                    str(cap) for cap in m.server_capabilities
+                    if str(cap).startswith("urn:ietf:params:netconf:")),
             }
+            if version_error is not None:
+                result["version_error"] = version_error
+            return result
     except (AuthenticationError, SSHError) as e:
         return {"success": False, "alive": False, "host": conn["host"], "device_name": device_name,
                 "error": str(e), "error_type": type(e).__name__}
