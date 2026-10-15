@@ -394,6 +394,56 @@ class PreviewConfigFlowTests(unittest.TestCase):
         self.assertIsNone(result["diff_stats"])
 
 
+class GetConfigXmlPlatformFilterTests(unittest.TestCase):
+    """An unfiltered read gets the NX-OS root filter on NX-OS only."""
+
+    def _call(self, caps, filter_xml=None):
+        m = MagicMock()
+        m.server_capabilities = caps
+        m.get_config.return_value.data_xml = "<data/>"
+        main._get_config_xml(m, "running", filter_xml)
+        return m.get_config.call_args.kwargs["filter"]
+
+    def test_nxos_without_filter_uses_system_subtree(self):
+        self.assertEqual(self._call([NXOS_CAP]), ("subtree", main._NXOS_ROOT_FILTER))
+        self.assertEqual(main._NXOS_ROOT_FILTER,
+                         '<System xmlns="http://cisco.com/ns/yang/cisco-nx-os-device"/>')
+
+    def test_iosxe_without_filter_stays_unfiltered(self):
+        self.assertIsNone(self._call([IOSXE_CAP]))
+
+    def test_unknown_platform_without_filter_stays_unfiltered(self):
+        self.assertIsNone(self._call(["urn:ietf:params:netconf:base:1.0"]))
+
+    def test_explicit_filter_wins_on_nxos(self):
+        self.assertEqual(self._call([NXOS_CAP], "<x/>"), ("subtree", "<x/>"))
+
+
+class NxosPreviewFlowTests(unittest.TestCase):
+    def test_nxos_preview_reads_with_filter_edits_and_falls_back_to_xml_diff(self):
+        m = MagicMock()
+        m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0", NXOS_CAP]
+        m.get_config.side_effect = [MagicMock(data_xml="<data><a>1</a></data>"),
+                                    MagicMock(data_xml="<data><a>1</a></data>"),
+                                    MagicMock(data_xml="<data><a>2</a></data>")]
+        m.dispatch.side_effect = _make_rpc_error()
+        thread = MagicMock()
+        box = {"result": None, "error": "get-modelled-config-clis RPC not supported", "exc": None, "seconds": 0.1}
+        session = MagicMock()
+        session.__enter__.return_value = m
+        conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+        args = MagicMock(config_xml="<config/>", force_discard=False, diff=True)
+        with patch.object(main, "_session", return_value=session), \
+             patch.object(main, "_start_background_render", return_value=(thread, box)), \
+             patch.object(main, "_acquire_candidate_lock", return_value=0.0):
+            result = main.preview_config(conn, args)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["preview_mode"], "xml-diff")
+        m.edit_config.assert_called_once()
+        for c in m.get_config.call_args_list:
+            self.assertEqual(c.kwargs["filter"], ("subtree", main._NXOS_ROOT_FILTER))
+
+
 class SendConfigXmlTests(unittest.TestCase):
     """send_command's push path, with a mocked ncclient manager."""
 

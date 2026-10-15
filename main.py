@@ -98,6 +98,11 @@ from ncclient.transport.errors import AuthenticationError, SSHError
 # just call it and handle unknown-element (see _get_modelled_config_clis).
 _CLI_RPC_NS = "http://cisco.com/ns/yang/Cisco-IOS-XE-cli-rpc"
 
+# NX-OS refuses an unfiltered <get-config> (operation-not-supported, "Request
+# without namespace and filter is an unsupported operation"), so a read with
+# no caller filter sends this whole-device subtree filter instead.
+_NXOS_ROOT_FILTER = '<System xmlns="http://cisco.com/ns/yang/cisco-nx-os-device"/>'
+
 # Single platform (IOS XE) — selects ncclient's generic IETF-style device
 # handler.
 _DEVICE_PARAMS = {"name": "iosxe"}
@@ -171,7 +176,11 @@ def _has_persistent_confirmed_commit(m) -> bool:
 def _get_config_xml(m, source: str, filter_xml: str = None) -> str:
     """Fetch a datastore's config as pretty-printed XML text, over an
     already-open session. Plain <get-config> — always available regardless
-    of train/platform, unlike get-modelled-config-clis."""
+    of train/platform, unlike get-modelled-config-clis. An explicit filter_xml
+    always wins; with none, NX-OS gets _NXOS_ROOT_FILTER and every other
+    platform stays unfiltered."""
+    if not filter_xml and _detect_platform(m) == "nxos":
+        filter_xml = _NXOS_ROOT_FILTER
     reply = m.get_config(
         source=source,
         filter=("subtree", filter_xml) if filter_xml else None,
