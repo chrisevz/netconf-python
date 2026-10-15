@@ -542,7 +542,7 @@ def _start_background_render(conn, datastore: str = "running"):
     return thread, box
 
 
-def _preview_render(m, running_xml: str, candidate_after_xml: str, background=None) -> dict:
+def _preview_render(m, running_xml: str, candidate_after_xml: str, background=None, cli_render: bool = True) -> dict:
     """Produce the operator-facing diff, trying the device's own CLI
     renderer first and falling back to a structural XML diff of plain
     get-config output when get-modelled-config-clis isn't available.
@@ -558,13 +558,16 @@ def _preview_render(m, running_xml: str, candidate_after_xml: str, background=No
     session failed, running is rendered in `m` after all (timings.parallel False).
 
     `candidate_after_xml` is the candidate XML after the edit, or a zero-argument
-    callable that reads it. Only the XML-diff fallback needs it, and a plain
+    callable that reads it. With cli_render=False no CLI render is attempted at all
+    (straight to the XML diff). Only the XML-diff fallback needs it, and a plain
     get-config of a large stack config is slow (about 75 s on a two-member C9500
     stack), so the device-rendered path never calls the reader.
     """
     render_started = time.monotonic()
     timings = {"parallel": background is not None}
-    if background is not None:
+    if not cli_render:
+        running_clis = candidate_clis = running_render_err = candidate_render_err = None
+    elif background is not None:
         # The running render has been going since before the staging work. Start the candidate
         # render now; an unsupported RPC fails fast (unknown-element) and falls to the XML diff.
         candidate_started = time.monotonic()
@@ -693,7 +696,10 @@ def preview_config(conn, args) -> dict:
             # The CLI render of RUNNING is the slowest device-side step and needs neither the lock nor the
             # edit, so it runs in a second read-only session from the start, hidden behind the two plain
             # get-config reads below (measured on a C9500 stack: ~36 s render, ~120 s of reads).
-            background = _start_background_render(conn, "running")
+            # get-modelled-config-clis is IOS XE only: on NX-OS skip the CLI render entirely
+            # (no background session, no RPC) and go straight to the XML diff.
+            cli_render = _detect_platform(m) != "nxos"
+            background = _start_background_render(conn, "running") if cli_render else None
 
             running_xml = _get_config_xml(m, "running")
             steps.lap("get_running_xml")
@@ -757,7 +763,7 @@ def preview_config(conn, args) -> dict:
                     steps.record("get_candidate_xml_after_edit", time.monotonic() - started)
                     return xml
 
-                render = _preview_render(m, running_xml, read_candidate_xml, background)
+                render = _preview_render(m, running_xml, read_candidate_xml, background, cli_render)
                 steps.lap("render")
                 if not include_diff:
                     render["diff"] = None

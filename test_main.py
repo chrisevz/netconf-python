@@ -426,17 +426,20 @@ class NxosPreviewFlowTests(unittest.TestCase):
         m.get_config.side_effect = [MagicMock(data_xml="<data><a>1</a></data>"),
                                     MagicMock(data_xml="<data><a>1</a></data>"),
                                     MagicMock(data_xml="<data><a>2</a></data>")]
-        m.dispatch.side_effect = _make_rpc_error()
-        thread = MagicMock()
-        box = {"result": None, "error": "get-modelled-config-clis RPC not supported", "exc": None, "seconds": 0.1}
+        # a non-unknown-element error: if the render were attempted the preview would fail
+        m.dispatch.side_effect = _make_rpc_error("operation-not-supported")
         session = MagicMock()
         session.__enter__.return_value = m
         conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
         args = MagicMock(config_xml="<config/>", force_discard=False, diff=True)
         with patch.object(main, "_session", return_value=session), \
-             patch.object(main, "_start_background_render", return_value=(thread, box)), \
+             patch.object(main, "_start_background_render") as background, \
+             patch.object(main, "_get_modelled_config_clis") as render, \
              patch.object(main, "_acquire_candidate_lock", return_value=0.0):
             result = main.preview_config(conn, args)
+        background.assert_not_called()
+        render.assert_not_called()
+        m.dispatch.assert_not_called()
         self.assertTrue(result["success"], result)
         self.assertEqual(result["preview_mode"], "xml-diff")
         m.edit_config.assert_called_once()
