@@ -606,7 +606,7 @@ class IsAliveCapabilityTests(unittest.TestCase):
             return main.is_alive({"host": "10.0.0.1"}, MagicMock())
 
     def test_reports_persistent_confirmed_commit_when_advertised(self):
-        result = self._run([IOSXE_CAP, "urn:ietf:params:netconf:capability:confirmed-commit:1.1"])
+        result = self._run(["urn:ietf:params:netconf:capability:confirmed-commit:1.1"])
         self.assertTrue(result["alive"])
         self.assertEqual(result["output"], "17.15")
         self.assertTrue(result["persist_confirmed_commit"])
@@ -647,13 +647,18 @@ class IsAlivePlatformTests(unittest.TestCase):
         self.assertEqual(result["platform"], "iosxe")
         self.assertEqual(result["output"], "17.15")
 
-    def test_unknown_platform_skips_version_read(self):
-        result, m = self._run(["urn:ietf:params:netconf:base:1.1"])
+    def test_unknown_platform_uses_iosxe_read(self):
+        result, m = self._run(["urn:ietf:params:netconf:base:1.1"], self.IOSXE_REPLY)
         self.assertTrue(result["alive"])
         self.assertEqual(result["platform"], "unknown")
-        self.assertEqual(result["output"], "")
-        self.assertNotIn("version_error", result)
-        m.get.assert_not_called()
+        self.assertEqual(result["output"], "17.15")
+        self.assertIn("Cisco-IOS-XE-native", m.get.call_args.kwargs["filter"][1])
+
+    def test_unknown_platform_read_failure_only_adds_version_error(self):
+        result, _ = self._run([], error=_make_rpc_error("unknown-namespace"))
+        self.assertTrue(result["alive"])
+        self.assertEqual(result["platform"], "unknown")
+        self.assertIn("version_error", result)
 
     def test_version_rpc_error_still_alive_on_both_platforms(self):
         for cap, platform in ((IOSXE_CAP, "iosxe"), (NXOS_CAP, "nxos")):

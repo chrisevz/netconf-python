@@ -265,12 +265,13 @@ def is_alive(conn, args) -> dict:
             # Opening the session is the liveness proof; a failed version read
             # (wrong model for this platform, RPCError, bad XML) is reported
             # but never turns the result into alive:false.
-            if platform in _VERSION_READS:
-                try:
-                    version = _read_version(m, platform)
-                except Exception as e:
-                    version = ""
-                    version_error = str(e)[:200]
+            # "unknown" falls back to the IOS XE read so a device that omits
+            # its native module from the hello still reports a version.
+            try:
+                version = _read_version(m, platform if platform in _VERSION_READS else "iosxe")
+            except Exception as e:
+                version = ""
+                version_error = str(e)[:200]
             confirmed_1_1 = _has_persistent_confirmed_commit(m)
             result = {
                 "success": True,
