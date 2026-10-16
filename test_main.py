@@ -773,8 +773,10 @@ class NormalizeArgsTests(unittest.TestCase):
 class SaveConfigTests(unittest.TestCase):
     """save_config tries cisco-ia first, then falls back to Cisco-IOS-XE-rpc copy."""
 
-    def _run(self, dispatch_side_effect):
+    def _run(self, dispatch_side_effect, capabilities=None):
         m = MagicMock()
+        if capabilities is not None:
+            m.server_capabilities = capabilities
         m.dispatch.side_effect = dispatch_side_effect
         session = MagicMock()
         session.__enter__.return_value = m
@@ -806,6 +808,30 @@ class SaveConfigTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["error_type"], "SaveUnsupported")
         self.assertEqual(len(result["failed_attempts"]), 2)
+
+
+    def test_iosxe_still_uses_cisco_ia_first(self):
+        result, m = self._run([self._reply("Save running-config successful")], [IOSXE_CAP])
+        self.assertEqual(result["method"], "cisco-ia:save-config")
+        self.assertIn("cisco-ia", m.dispatch.call_args.args[0].tag)
+
+    def test_nxos_uses_the_device_model_copy_rpc_only(self):
+        ok = MagicMock()
+        ok.xml = '<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><ok/></rpc-reply>'
+        result, m = self._run([ok], [NXOS_CAP])
+        self.assertTrue(result["success"])
+        self.assertEqual(result["method"], "cisco-nx-os-device:copy_running_config_src")
+        self.assertIsNone(result["result"])
+        self.assertEqual(m.dispatch.call_count, 1)
+        sent = m.dispatch.call_args.args[0]
+        self.assertEqual(sent.tag, "{http://cisco.com/ns/yang/cisco-nx-os-device}copy_running_config_src")
+        self.assertEqual(sent[0].tag, "{http://cisco.com/ns/yang/cisco-nx-os-device}startup-config")
+
+    def test_nxos_refusal_is_reported_without_trying_ios_xe_rpcs(self):
+        result, m = self._run([_make_rpc_error("operation-not-supported")], [NXOS_CAP])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "SaveUnsupported")
+        self.assertEqual(m.dispatch.call_count, 1)
 
 
 class FormatForHumansTests(unittest.TestCase):

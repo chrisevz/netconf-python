@@ -21,7 +21,7 @@ later phase — it isn't part of this repo anymore).
 | Action | Purpose | Notes |
 |---|---|---|
 | `netconf-is-alive` | Confirm device responds to NETCONF | Returns JSON with `alive`, `output` (software version via `<get>`: IOS XE native model, e.g. `17.15`, or NX-OS `nxosVersion`, e.g. `10.5(5)`), `platform` (`iosxe`/`nxos`/`unknown`, from advertised modules), `capabilities` (booleans: candidate, validate, confirmed-commit 1.0/1.1, writable-running, rollback-on-error, startup) and `base_capabilities` (the `urn:ietf:params:netconf:` ones only). A failed version read never fails the check: `output` is empty and `version_error` is set |
-| `netconf-save-config` | Copy running-config to startup-config (write memory) after a push | Tries `cisco-ia:save-config`, falls back to `Cisco-IOS-XE-rpc` `copy`; result says which `method` worked. Saves the whole running config |
+| `netconf-save-config` | Copy running-config to startup-config (write memory) after a push | IOS XE: tries `cisco-ia:save-config`, falls back to `Cisco-IOS-XE-rpc` `copy`. NX-OS: `copy_running_config_src` from the `cisco-nx-os-device` model (Cisco-documented since 9.2(1)). Result says which `method` worked. Saves the whole running config |
 | `netconf-get-config` | Retrieve running or candidate configuration | XML only |
 | `netconf-get-config-clis` | Render running or candidate as CLI text | Uses `get-modelled-config-clis` (`Cisco-IOS-XE-cli-rpc`) — the device's own modelled-config-to-CLI renderer. This is the mechanism behind `netconf-preview-config`'s `preview_mode="device-rendered"` outcome. |
 | `netconf-preview-config` | **The core feature.** Stage a proposed `config_xml` change, diff it against running, then discard | Never commits. See "Preview and push workflow" below. |

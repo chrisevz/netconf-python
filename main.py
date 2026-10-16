@@ -1102,6 +1102,15 @@ _SAVE_CONFIG_RPCS = [
      "</copy>"),
 ]
 
+# NX-OS has no startup datastore over NETCONF and refuses the IOS XE RPCs;
+# Cisco documents its own copy RPC in the device model (since 9.2(1)).
+_NXOS_SAVE_CONFIG_RPCS = [
+    ("cisco-nx-os-device:copy_running_config_src",
+     '<copy_running_config_src xmlns="http://cisco.com/ns/yang/cisco-nx-os-device">'
+     "<startup-config/>"
+     "</copy_running_config_src>"),
+]
+
 
 def save_config(conn, args) -> dict:
     """Persist running-config to startup-config (NETCONF equivalent of
@@ -1112,7 +1121,8 @@ def save_config(conn, args) -> dict:
     attempts = []
     try:
         with _session(conn) as m:
-            for method, rpc_xml in _SAVE_CONFIG_RPCS:
+            rpcs = _NXOS_SAVE_CONFIG_RPCS if _detect_platform(m) == "nxos" else _SAVE_CONFIG_RPCS
+            for method, rpc_xml in rpcs:
                 try:
                     reply = m.dispatch(to_ele(rpc_xml))
                 except RPCError as e:
