@@ -378,6 +378,31 @@ def _acquire_candidate_lock(m, timeout: int, poll_interval: float) -> float:
             time.sleep(poll_interval)
 
 
+def _try_candidate_lock(m, conn):
+    """Take the candidate lock with the usual retry rules. Returns
+    (seconds, error): error is None when the lock is held, else the RPCError
+    the device refused with, and seconds is then how long the attempt took
+    (reported as lock_wait_seconds). Any non-RPCError exception propagates."""
+    started = time.monotonic()
+    try:
+        return _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"]), None
+    except RPCError as e:
+        return time.monotonic() - started, e
+
+
+def _candidate_locked_result(conn, device_name, error, waited) -> dict:
+    """Failure result for a candidate lock that could not be taken: another
+    session holds it, or the device refused it for another reason (error_type
+    CandidateLocked, with the device's own message and tag). Nothing was edited
+    or committed on this path."""
+    return {"success": False, "host": conn["host"], "device_name": device_name,
+            "error": f"could not take the candidate lock — nothing was edited or committed: {error}",
+            "error_type": "CandidateLocked",
+            "rpc_tag": getattr(error, "tag", None),
+            "lock_wait_seconds": round(waited, 2),
+            "committed": False}
+
+
 def _normalize_text(text: str) -> str:
     """rstrip each line, drop blank lines, join with \\n. Used for hashing
     and for change-detection comparisons (dirty check, has_changes) so
@@ -401,13 +426,24 @@ def _diff_lines(text: str) -> list:
 
 
 def _text_hash(text: str) -> str:
-    """sha256 of normalized text, first 16 hex chars — short fingerprint
-    used for netconf-preview-config's running_hash and
-    netconf-send-command's expect_running_hash drift guard. Always computed
-    from the running-config XML (via _get_config_xml), never from a CLI
-    render, so the drift guard works identically in both preview_mode
-    outcomes."""
+    """sha256 of normalized text, first 16 hex chars — the fingerprint of the
+    running-config XML (via _get_config_xml). It is netconf-preview-config's
+    running_hash only when the preview fell back to the XML diff (no CLI render),
+    and the push's XML drift guard (unprefixed expect_running_hash) compares
+    against it. See _cli_hash for the CLI-render fingerprint."""
     return hashlib.sha256(_normalize_text(text).encode("utf-8")).hexdigest()[:16]
+
+
+_CLI_HASH_PREFIX = "cli-sha256:"
+
+
+def _cli_hash(text: str) -> str:
+    """Fingerprint of a running-config CLI render (get-modelled-config-clis):
+    "cli-sha256:" + the full sha256 of the normalized text. The prefix tells the
+    push which source to re-fingerprint, so a hash never gets compared against
+    the other kind. The ONE helper both netconf-preview-config (running_hash)
+    and netconf-send-command (expect_running_hash drift guard) use."""
+    return _CLI_HASH_PREFIX + hashlib.sha256(_normalize_text(text).encode("utf-8")).hexdigest()
 
 
 _SECRET_PLACEHOLDER = "GATEWAYSECRET_"
@@ -557,8 +593,9 @@ def _preview_render(m, running_xml: str, candidate_after_xml: str, background=No
     overlap; without it they run one after the other in `m`. If the background
     session failed, running is rendered in `m` after all (timings.parallel False).
 
-    `candidate_after_xml` is the candidate XML after the edit, or a zero-argument
-    callable that reads it. With cli_render=False no CLI render is attempted at all
+    `running_xml` and `candidate_after_xml` are the XML text, or a zero-argument
+    callable that reads it (running is read lazily when the pre-edit reads were
+    skipped). With cli_render=False no CLI render is attempted at all
     (straight to the XML diff). Only the XML-diff fallback needs it, and a plain
     get-config of a large stack config is slow (about 75 s on a two-member C9500
     stack), so the device-rendered path never calls the reader.
@@ -614,6 +651,8 @@ def _preview_render(m, running_xml: str, candidate_after_xml: str, background=No
             "timings": timings,
         }
 
+    if callable(running_xml):
+        running_xml = running_xml()
     if callable(candidate_after_xml):
         candidate_after_xml = candidate_after_xml()
     diff_text = "\n".join(difflib.unified_diff(
@@ -638,33 +677,41 @@ def preview_config(conn, args) -> dict:
     """Stage a proposed config_xml change, diff it against running, and
     leave zero state on the device — all in one session.
 
-    Sequence: get-config(running) -> get-config(candidate) -> dirty check
-    (if candidate already differs from running, another session has
-    uncommitted work there — refuse with a dirty_diff unless force_discard,
-    in which case discard it, no lock needed) -> lock candidate ->
-    edit_config with the caller's config_xml -> validate (capability-gated,
-    captured not raised) -> render/diff (device CLI render if available;
-    else XML diff, which is the only case that re-reads candidate with
-    get-config) -> discard_changes + unlock in a finally, discarding only if
-    we actually edited. The CLI render of running starts in a second
-    session right after the candidate-capability check, so it runs while
-    the slow get-config reads and the staging work happen (see timings in
-    the result). If the dirty check refuses, that render is abandoned (daemon
-    thread, ends with the process).
+    Sequence on IOS XE (anything but NX-OS): the CLI render of running starts in
+    a second session -> lock candidate -> edit_config with the caller's
+    config_xml -> validate (capability-gated, captured not raised) -> CLI render
+    of candidate + diff against the running render -> discard_changes + unlock
+    in a finally, discarding only if we actually edited. There are NO full
+    get-config reads before the edit: a lock on the candidate is only granted
+    when it has no uncommitted changes (RFC 6241 section 7.5; confirmed live on
+    IOS XE 17.15: lock on a dirty candidate fails with operation-failed /
+    "there are outstanding changes to the database"), so a granted lock proves
+    the candidate is clean. running_hash is "cli-sha256:" + the hash of the
+    running CLI render the diff used (_cli_hash), so no running XML read either.
+    Only the XML-diff fallback (render unavailable) reads running and candidate
+    as XML, after the edit, and then running_hash is the plain XML hash.
 
-    The dirty check runs BEFORE the lock, not after. A dirty candidate is
-    exactly what makes lock(candidate) fail (operation-failed / "there are
-    outstanding changes to the database" — confirmed live on IOS XE 17.15),
-    so a dirty check placed after the lock is unreachable on the one input
-    it exists to handle. This ordering only works because discard-changes
-    requires no lock (RFC 6241 §8.3.4.2) — that's what makes a pre-lock
-    discard possible at all. The dirty check itself uses plain get-config,
-    not get-modelled-config-clis — it must work identically whether or not
-    the render RPC is available on this train.
+    If the lock is refused with a tag other than lock-denied (the dirty-candidate
+    signature), the dirty check runs: plain get-config of running and candidate,
+    compared. Dirty without force_discard -> DirtyCandidate with a dirty_diff
+    (no lock held, so no lock_wait_seconds key). Dirty with force_discard ->
+    discard_changes (needs no lock, RFC 6241 section 8.3.4.2), take the lock
+    again and continue. Not dirty -> CandidateLocked. A lock-denied that outlasts
+    lock_timeout (another session holds the lock) -> CandidateLocked straight
+    away, no reads. Discarding stays gated on force_discard, never unconditional,
+    or preview would silently destroy another session's pending work.
 
-    Because of this, the DirtyCandidate return happens before any lock is
-    taken, so it has no lock_wait_seconds key. That's expected — its
-    absence itself signals the call never reached the lock.
+    Sequence on NX-OS (unchanged, the lock-on-dirty behaviour is not confirmed
+    there): get-config(running) -> get-config(candidate) -> dirty check (same
+    DirtyCandidate / force_discard rules) -> lock candidate -> edit -> validate
+    -> XML diff (no CLI render RPC) -> discard + unlock. running_hash is the
+    plain XML hash.
+
+    A lock that cannot be taken ends in CandidateLocked on both platforms
+    (nothing edited, nothing committed). The CLI render of running runs in the
+    second session while the staging work happens (see timings in the result).
+    If the call returns before the render is joined, that render is abandoned
+    (daemon thread, ends with the process).
 
     Never commits (committed is always False in the result) and never
     leaves the candidate populated or locked on any exit path reached after
@@ -694,46 +741,69 @@ def preview_config(conn, args) -> dict:
                         "error": "device has no candidate datastore — netconf-preview-config requires it"}
 
             # The CLI render of RUNNING is the slowest device-side step and needs neither the lock nor the
-            # edit, so it runs in a second read-only session from the start, hidden behind the two plain
-            # get-config reads below (measured on a C9500 stack: ~36 s render, ~120 s of reads).
+            # edit, so it runs in a second read-only session from the start, hidden behind the staging work
+            # (measured on a C9500 stack: ~36 s render).
             # get-modelled-config-clis is IOS XE only: on NX-OS skip the CLI render entirely
             # (no background session, no RPC) and go straight to the XML diff.
             cli_render = _detect_platform(m) != "nxos"
             background = _start_background_render(conn, "running") if cli_render else None
 
-            running_xml = _get_config_xml(m, "running")
-            steps.lap("get_running_xml")
-            candidate_before_xml = _get_config_xml(m, "candidate")
-            steps.lap("get_candidate_xml")
+            # IOS XE: lock first. A granted lock proves the candidate is clean (RFC 6241 section 7.5), which
+            # skips the two full get-config reads (~64 s + ~74 s on the lab switch). NX-OS keeps the dirty
+            # check first (lock-on-dirty is not confirmed there).
+            lock_first = cli_render
+            running_xml = None
+            lock_wait, lock_error = 0.0, None
+            if lock_first:
+                lock_wait, lock_error = _try_candidate_lock(m, conn)
+                if lock_error is not None and getattr(lock_error, "tag", None) == "lock-denied":
+                    # another session holds the lock and did not let go within lock_timeout
+                    return _candidate_locked_result(conn, device_name, lock_error, lock_wait)
+                steps.lap("lock" if lock_error is None else "lock_refused")
 
-            if _normalize_text(running_xml) != _normalize_text(candidate_before_xml):
-                if not force_discard:
-                    # Return the diff, not just the refusal — the caller needs to
-                    # see what they'd be destroying before deciding. This may be
-                    # real pending provisioning from another session, not noise.
-                    dirty_diff = "\n".join(difflib.unified_diff(
-                        _diff_lines(running_xml), _diff_lines(candidate_before_xml),
-                        fromfile="running", tofile="candidate", lineterm="",
-                    ))
-                    return {
-                        "success": False, "host": conn["host"], "device_name": device_name,
-                        "error": "candidate datastore is dirty (differs from running) — another "
-                                 "session may have uncommitted work staged there. Pass "
-                                 "force_discard=true to discard it and proceed.",
-                        "error_type": "DirtyCandidate",
-                        "dirty_diff": dirty_diff,
-                        "committed": False,
-                    }
-                # force_discard=true: clear it now, before locking — discard-changes
-                # requires no lock (RFC 6241 §8.3.4.2). Must stay gated on
-                # force_discard, never unconditional, or preview silently destroys
-                # another session's pending work.
-                m.discard_changes()
+            if not lock_first or lock_error is not None:
+                running_xml = _get_config_xml(m, "running")
+                steps.lap("get_running_xml")
+                candidate_before_xml = _get_config_xml(m, "candidate")
+                steps.lap("get_candidate_xml")
 
-            running_hash = _text_hash(running_xml)
+                if _normalize_text(running_xml) != _normalize_text(candidate_before_xml):
+                    if not force_discard:
+                        # Return the diff, not just the refusal — the caller needs to
+                        # see what they'd be destroying before deciding. This may be
+                        # real pending provisioning from another session, not noise.
+                        dirty_diff = "\n".join(difflib.unified_diff(
+                            _diff_lines(running_xml), _diff_lines(candidate_before_xml),
+                            fromfile="running", tofile="candidate", lineterm="",
+                        ))
+                        return {
+                            "success": False, "host": conn["host"], "device_name": device_name,
+                            "error": "candidate datastore is dirty (differs from running) — another "
+                                     "session may have uncommitted work staged there. Pass "
+                                     "force_discard=true to discard it and proceed.",
+                            "error_type": "DirtyCandidate",
+                            "dirty_diff": dirty_diff,
+                            "committed": False,
+                        }
+                    # force_discard=true: clear it now — discard-changes requires no lock
+                    # (RFC 6241 section 8.3.4.2). Must stay gated on force_discard, never
+                    # unconditional, or preview silently destroys another session's pending work.
+                    m.discard_changes()
+                    if lock_first:
+                        # the refused lock is retried now that the candidate is clean
+                        lock_wait, lock_error = _try_candidate_lock(m, conn)
+                        if lock_error is not None:
+                            return _candidate_locked_result(conn, device_name, lock_error, lock_wait)
+                        steps.lap("lock")
+                elif lock_error is not None:
+                    # candidate is clean, so the refusal had another cause: report it, edit nothing
+                    return _candidate_locked_result(conn, device_name, lock_error, lock_wait)
 
-            lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
-            steps.lap("lock")
+            if not lock_first:
+                lock_wait, lock_error = _try_candidate_lock(m, conn)
+                if lock_error is not None:
+                    return _candidate_locked_result(conn, device_name, lock_error, lock_wait)
+                steps.lap("lock")
             edited = False
             result = None
             try:
@@ -763,8 +833,23 @@ def preview_config(conn, args) -> dict:
                     steps.record("get_candidate_xml_after_edit", time.monotonic() - started)
                     return xml
 
-                render = _preview_render(m, running_xml, read_candidate_xml, background, cli_render)
+                def read_running_xml():
+                    # only called by the XML-diff fallback when the pre-edit reads were skipped (lock first)
+                    started = time.monotonic()
+                    xml = _get_config_xml(m, "running")
+                    steps.record("get_running_xml_after_edit", time.monotonic() - started)
+                    return xml
+
+                render = _preview_render(m, running_xml if running_xml is not None else read_running_xml,
+                                         read_candidate_xml, background, cli_render)
                 steps.lap("render")
+                # Fingerprint of the running config the diff was made against. With the CLI render it is the
+                # hash of that render (the same helper the push re-checks with); with the XML-diff fallback it
+                # is the plain XML hash. Either way it is of the text this preview diffed.
+                if render["preview_mode"] == "device-rendered":
+                    running_hash = _cli_hash(render["running_config"])
+                else:
+                    running_hash = _text_hash(render["running_config"])
                 if not include_diff:
                     render["diff"] = None
                     render["diff_rows"] = None
@@ -837,7 +922,13 @@ def send_command(conn, args) -> dict:
     netconf-confirm-commit call presents the returned persist_id. So if the
     workflow, the gateway or this process dies mid-review, the device still
     rolls back. Fail closed: if the device does not advertise 1.1 nothing is
-    edited or committed, and there is no fallback to a plain commit."""
+    edited or committed, and there is no fallback to a plain commit.
+
+    expect_running_hash is the running_hash of a preview. "cli-sha256:..." is
+    re-checked against a fresh CLI render of running (fail closed with
+    DriftCheckUnavailable if it cannot be rendered); any other value against the
+    plain XML hash, as before. A candidate lock that cannot be taken ends in
+    CandidateLocked, with nothing edited or committed."""
     device_name = conn.get("device_name") or conn["host"]
     config_xml = getattr(args, "config_xml", None)
     if not config_xml:
@@ -857,8 +948,31 @@ def send_command(conn, args) -> dict:
                 # netconf-preview-config call and wants to be sure nothing else
                 # changed running config in between. Re-fingerprint before
                 # touching candidate at all, and refuse to apply on a mismatch.
-                current_running_xml = _get_config_xml(m, "running")
-                actual_hash = _text_hash(current_running_xml)
+                # The prefix says what the preview hashed: "cli-sha256:" is a
+                # running CLI render (the usual IOS XE preview), anything else is
+                # the plain XML hash (XML-diff fallback, NX-OS, or a preview made
+                # by an older driver).
+                if expect_running_hash.startswith(_CLI_HASH_PREFIX):
+                    try:
+                        running_clis, render_error = _get_modelled_config_clis(m, "running")
+                    except Exception as e:
+                        running_clis, render_error = None, f"{type(e).__name__}: {e}"
+                    if running_clis is None:
+                        # Cannot re-fingerprint: fail closed, never push unchecked.
+                        return {
+                            "success": False,
+                            "host": conn["host"],
+                            "device_name": device_name,
+                            "error": "could not render running config to check for drift "
+                                     f"(expect_running_hash is a CLI-render hash) — refusing to apply: "
+                                     f"{render_error or 'empty render'}",
+                            "error_type": "DriftCheckUnavailable",
+                            "committed": False,
+                        }
+                    actual_hash = _cli_hash(running_clis)
+                else:
+                    current_running_xml = _get_config_xml(m, "running")
+                    actual_hash = _text_hash(current_running_xml)
                 if actual_hash != expect_running_hash:
                     return {
                         "success": False,
@@ -885,7 +999,9 @@ def send_command(conn, args) -> dict:
                         "error_type": "NoConfirmedCommit",
                         "committed": False}
 
-            lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
+            lock_wait, lock_error = _try_candidate_lock(m, conn)
+            if lock_error is not None:
+                return _candidate_locked_result(conn, device_name, lock_error, lock_wait)
             try:
                 # IOS XE's candidate is a single global datastore, not per-session.
                 # The lock grants exclusive write access; it does NOT guarantee an

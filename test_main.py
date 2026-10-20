@@ -314,9 +314,14 @@ class ParallelRenderTests(unittest.TestCase):
 class PreviewConfigFlowTests(unittest.TestCase):
     """preview_config end to end with a mocked manager: ordering and result shape."""
 
-    def _run(self, diff=True, render_supported=True):
+    def _run(self, diff=True, render_supported=True, reads=None, lock=None, force_discard=False,
+             edit_error=None):
+        """reads: values for the mocked _get_config_xml (default: the two XML reads only an XML diff needs,
+        running then candidate after the edit). lock: side_effect for _acquire_candidate_lock."""
         m = MagicMock()
         m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0"]
+        if edit_error is not None:
+            m.edit_config.side_effect = edit_error
         order = MagicMock()
         thread = MagicMock()
         if render_supported:
@@ -330,9 +335,11 @@ class PreviewConfigFlowTests(unittest.TestCase):
         session.__enter__.return_value = m
         order.start.return_value = (thread, box)
         order.lock.return_value = 0.0
-        order.read.side_effect = ["<a>1</a>", "<a>1</a>", "<a>2</a>"]
+        if lock is not None:
+            order.lock.side_effect = lock
+        order.read.side_effect = reads if reads is not None else ["<a>1</a>", "<a>2</a>"]
         conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
-        args = MagicMock(config_xml="<config/>", force_discard=False, diff=diff)
+        args = MagicMock(config_xml="<config/>", force_discard=force_discard, diff=diff)
         with patch.object(main, "_session", return_value=session), \
              patch.object(main, "_start_background_render", order.start), \
              patch.object(main, "_acquire_candidate_lock", order.lock), \
@@ -348,27 +355,110 @@ class PreviewConfigFlowTests(unittest.TestCase):
         order.start.assert_called_once_with({"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1},
                                             "running")
 
-    def test_background_render_starts_before_the_slow_xml_reads(self):
-        _, order, _ = self._run()
+    def test_lock_ok_skips_both_pre_edit_xml_reads(self):
+        # CHANGED on purpose (was: background render starts before the two slow XML reads): a granted lock
+        # proves the candidate is clean (RFC 6241 section 7.5), so there are no pre-edit reads at all.
+        result, order, m = self._run()
+        self.assertTrue(result["success"], result)
         names = [c[0] for c in order.mock_calls if c[0] in ("start", "read", "lock")]
-        self.assertEqual(names, ["start", "read", "read", "lock"])
+        self.assertEqual(names, ["start", "lock"])
+        self.assertEqual(order.read.call_count, 0)
+        self.assertEqual(result["preview_mode"], "device-rendered")
 
-    def test_device_rendered_mode_never_reads_candidate_xml_after_the_edit(self):
+    def test_lock_ok_running_hash_is_the_cli_hash_of_the_running_render(self):
+        result, order, _ = self._run()
+        self.assertEqual(result["running_hash"], main._cli_hash("hostname a\ndescription old\n"))
+        self.assertTrue(result["running_hash"].startswith("cli-sha256:"))
+        self.assertEqual(order.read.call_count, 0)
+
+    def test_device_rendered_mode_never_reads_any_xml(self):
+        # CHANGED on purpose (was: reads running + candidate before the edit): now no XML read at all.
         result, order, _ = self._run()
         self.assertEqual(result["preview_mode"], "device-rendered")
-        self.assertEqual([c.args[1] for c in order.read.call_args_list], ["running", "candidate"])
+        self.assertEqual(order.read.call_args_list, [])
         self.assertNotIn("get_candidate_xml_after_edit", result["timings"]["steps"])
+        self.assertNotIn("get_running_xml_after_edit", result["timings"]["steps"])
 
-    def test_xml_diff_fallback_reads_candidate_xml_after_the_edit(self):
+    def test_xml_diff_fallback_reads_xml_only_after_the_edit_and_hashes_the_xml(self):
+        # CHANGED on purpose (was: running, candidate, candidate): the pre-edit reads are gone.
         result, order, m = self._run(render_supported=False)
         self.assertTrue(result["success"])
         self.assertEqual(result["preview_mode"], "xml-diff")
-        self.assertEqual([c.args[1] for c in order.read.call_args_list], ["running", "candidate", "candidate"])
+        self.assertEqual([c.args[1] for c in order.read.call_args_list], ["running", "candidate"])
+        self.assertIn("get_running_xml_after_edit", result["timings"]["steps"])
         self.assertIn("get_candidate_xml_after_edit", result["timings"]["steps"])
+        self.assertEqual(result["running_hash"], main._text_hash("<a>1</a>"))
+        self.assertFalse(result["running_hash"].startswith("cli-sha256:"))
         self.assertTrue(result["has_changes"])
         self.assertTrue(result["diff_rows"])
         m.discard_changes.assert_called()
         m.unlock.assert_called_once_with(target="candidate")
+
+    def test_lock_refused_and_dirty_returns_the_dirty_candidate_result(self):
+        result, order, m = self._run(lock=_make_rpc_error("operation-failed"), reads=["<a>1</a>", "<a>9</a>"])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "DirtyCandidate")
+        self.assertIn("-<a>1</a>", result["dirty_diff"])
+        self.assertIn("+<a>9</a>", result["dirty_diff"])
+        self.assertFalse(result["committed"])
+        self.assertNotIn("lock_wait_seconds", result)
+        self.assertEqual([c.args[1] for c in order.read.call_args_list], ["running", "candidate"])
+        m.discard_changes.assert_not_called()
+        m.edit_config.assert_not_called()
+
+    def test_lock_refused_dirty_with_force_discard_discards_relocks_and_continues(self):
+        result, order, m = self._run(lock=[_make_rpc_error("operation-failed"), 0.5],
+                                     reads=["<a>1</a>", "<a>9</a>"], force_discard=True)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(order.lock.call_count, 2)
+        names = [c[0] for c in m.mock_calls if c[0] in ("discard_changes", "edit_config", "unlock")]
+        self.assertEqual(names[:2], ["discard_changes", "edit_config"])
+        self.assertEqual(result["lock_wait_seconds"], 0.5)
+        self.assertEqual(result["preview_mode"], "device-rendered")
+        self.assertTrue(result["running_hash"].startswith("cli-sha256:"))
+        m.unlock.assert_called_once_with(target="candidate")
+        self.assertFalse(result["committed"])
+
+    def test_force_discard_but_relock_fails_returns_candidate_locked_and_edits_nothing(self):
+        result, _, m = self._run(lock=[_make_rpc_error("operation-failed"), _make_rpc_error("lock-denied")],
+                                 reads=["<a>1</a>", "<a>9</a>"], force_discard=True)
+        self.assertEqual(result["error_type"], "CandidateLocked")
+        m.edit_config.assert_not_called()
+
+    def test_lock_refused_and_clean_returns_candidate_locked(self):
+        result, order, m = self._run(lock=_make_rpc_error("operation-failed"), reads=["<a>1</a>", "<a>1</a>"])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "CandidateLocked")
+        self.assertEqual(result["rpc_tag"], "operation-failed")
+        self.assertIn("lock_wait_seconds", result)
+        self.assertFalse(result["committed"])
+        m.edit_config.assert_not_called()
+        m.discard_changes.assert_not_called()
+
+    def test_lock_denied_returns_candidate_locked_without_any_read(self):
+        result, order, m = self._run(lock=_make_rpc_error("lock-denied"))
+        self.assertEqual(result["error_type"], "CandidateLocked")
+        self.assertEqual(result["rpc_tag"], "lock-denied")
+        self.assertEqual(order.read.call_count, 0)
+        self.assertFalse(result["committed"])
+        m.edit_config.assert_not_called()
+        m.discard_changes.assert_not_called()
+
+    def test_edit_failure_still_discards_and_unlocks(self):
+        result, _, m = self._run(edit_error=_make_rpc_error("operation-failed"))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "RPCError")
+        m.discard_changes.assert_called()
+        m.unlock.assert_called_once_with(target="candidate")
+        m.commit.assert_not_called()
+
+    def test_preview_and_push_hash_the_same_render_text_the_same_way(self):
+        text = "hostname a\ndescription old\n"
+        result, _, _ = self._run()
+        self.assertEqual(result["running_hash"], main._cli_hash(text))
+        # blank-line / trailing-space noise does not change it, a real change does
+        self.assertEqual(main._cli_hash(text), main._cli_hash("hostname a  \n\ndescription old\n\n"))
+        self.assertNotEqual(main._cli_hash(text), main._cli_hash("hostname b\ndescription old\n"))
 
     def test_result_carries_side_by_side_rows_stats_and_timings(self):
         result, _, m = self._run()
@@ -379,9 +469,11 @@ class PreviewConfigFlowTests(unittest.TestCase):
         self.assertEqual(result["diff_stats"]["added"], 1)
         self.assertTrue(result["timings"]["parallel"])
         steps = result["timings"]["steps"]
-        for name in ("connect", "get_running_xml", "get_candidate_xml", "lock", "edit_config", "validate",
-                     "render", "discard_unlock"):
+        # CHANGED on purpose: get_running_xml / get_candidate_xml are gone from the lock-first (IOS XE) flow
+        for name in ("connect", "lock", "edit_config", "validate", "render", "discard_unlock"):
             self.assertIn(name, steps)
+        self.assertNotIn("get_running_xml", steps)
+        self.assertNotIn("get_candidate_xml", steps)
         self.assertGreaterEqual(result["timings"]["driver_total_s"], 0)
         self.assertFalse(result["committed"])
         m.discard_changes.assert_called()
@@ -445,6 +537,177 @@ class NxosPreviewFlowTests(unittest.TestCase):
         m.edit_config.assert_called_once()
         for c in m.get_config.call_args_list:
             self.assertEqual(c.kwargs["filter"], ("subtree", main._NXOS_ROOT_FILTER))
+
+
+class NxosPreviewOrderTests(unittest.TestCase):
+    """NX-OS keeps the old order: dirty check (XML reads) first, then lock; plain XML hash."""
+
+    def _run(self, reads, lock=0.0, force_discard=False):
+        order = MagicMock()
+        m = order.m
+        m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0", NXOS_CAP]
+        m.dispatch.side_effect = _make_rpc_error("operation-not-supported")
+        order.read.side_effect = reads
+        order.lock.side_effect = lock if isinstance(lock, (list, Exception)) else None
+        if not isinstance(lock, (list, Exception)):
+            order.lock.return_value = lock
+        session = MagicMock()
+        session.__enter__.return_value = m
+        conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+        args = MagicMock(config_xml="<config/>", force_discard=force_discard, diff=True)
+        with patch.object(main, "_session", return_value=session), \
+             patch.object(main, "_start_background_render") as background, \
+             patch.object(main, "_acquire_candidate_lock", order.lock), \
+             patch.object(main, "_get_config_xml", order.read):
+            result = main.preview_config(conn, args)
+        background.assert_not_called()
+        return result, order
+
+    @staticmethod
+    def _names(order):
+        out = []
+        for c in order.mock_calls:
+            if c[0] == "read":
+                out.append("read:" + c.args[1])
+            elif c[0] in ("lock", "m.discard_changes", "m.edit_config", "m.unlock"):
+                out.append(c[0].replace("m.", ""))
+        return out
+
+    def test_call_sequence_is_reads_then_lock_then_edit_then_one_more_read(self):
+        result, order = self._run(["<a>1</a>", "<a>1</a>", "<a>2</a>"])
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self._names(order), ["read:running", "read:candidate", "lock", "edit_config",
+                                              "read:candidate", "discard_changes", "unlock"])
+        self.assertEqual(result["running_hash"], main._text_hash("<a>1</a>"))
+        self.assertIn("get_running_xml", result["timings"]["steps"])
+        self.assertIn("get_candidate_xml", result["timings"]["steps"])
+
+    def test_dirty_candidate_is_refused_before_any_lock(self):
+        result, order = self._run(["<a>1</a>", "<a>9</a>"])
+        self.assertEqual(result["error_type"], "DirtyCandidate")
+        self.assertNotIn("lock_wait_seconds", result)
+        self.assertEqual(self._names(order), ["read:running", "read:candidate"])
+
+    def test_force_discard_discards_before_the_lock(self):
+        result, order = self._run(["<a>1</a>", "<a>9</a>", "<a>2</a>"], force_discard=True)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self._names(order)[:5], ["read:running", "read:candidate", "discard_changes", "lock",
+                                                  "edit_config"])
+
+    def test_lock_failure_is_candidate_locked_after_the_reads(self):
+        result, order = self._run(["<a>1</a>", "<a>1</a>"], lock=_make_rpc_error("lock-denied"))
+        self.assertEqual(result["error_type"], "CandidateLocked")
+        self.assertEqual(result["rpc_tag"], "lock-denied")
+        self.assertFalse(result["committed"])
+        self.assertEqual(self._names(order), ["read:running", "read:candidate", "lock"])
+
+
+class PushDriftGuardTests(unittest.TestCase):
+    """send_command's expect_running_hash guard and lock labelling, mocked manager."""
+
+    RENDER = "hostname a\ndescription old\n"
+
+    def _run(self, expect, render=None, render_exc=None, xml="<a>1</a>", lock=0.0, caps=None):
+        order = MagicMock()
+        m = order.m
+        m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0", IOSXE_CAP] + (caps or [])
+        order.render.side_effect = render_exc
+        if render_exc is None:
+            order.render.return_value = render if render is not None else (self.RENDER, None)
+        order.read.return_value = xml
+        order.lock.side_effect = lock if isinstance(lock, Exception) else None
+        if not isinstance(lock, Exception):
+            order.lock.return_value = lock
+        session = MagicMock()
+        session.__enter__.return_value = m
+        conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+        args = MagicMock(config_xml="<config/>", expect_running_hash=expect, confirm_timeout=None)
+        with patch.object(main, "_session", return_value=session), \
+             patch.object(main, "_get_modelled_config_clis", order.render), \
+             patch.object(main, "_get_config_xml", order.read), \
+             patch.object(main, "_acquire_candidate_lock", order.lock):
+            return main.send_command(conn, args), order, m
+
+    def test_matching_cli_hash_proceeds_and_commits(self):
+        result, order, m = self._run(main._cli_hash(self.RENDER))
+        self.assertTrue(result["success"], result)
+        order.render.assert_called_once_with(m, "running")
+        order.read.assert_not_called()
+        m.commit.assert_called_once()
+
+    def test_cli_hash_check_happens_before_the_lock(self):
+        _, order, _ = self._run(main._cli_hash(self.RENDER))
+        names = [c[0] for c in order.mock_calls if c[0] in ("render", "lock")]
+        self.assertEqual(names, ["render", "lock"])
+
+    def test_cli_hash_mismatch_is_config_drift_with_no_lock_or_edit(self):
+        expected = main._cli_hash("hostname other\n")
+        result, order, m = self._run(expected)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "ConfigDrift")
+        self.assertEqual(result["expected_running_hash"], expected)
+        self.assertEqual(result["actual_running_hash"], main._cli_hash(self.RENDER))
+        order.lock.assert_not_called()
+        m.edit_config.assert_not_called()
+        m.commit.assert_not_called()
+
+    def test_render_exception_fails_closed(self):
+        result, order, m = self._run(main._cli_hash(self.RENDER), render_exc=_make_rpc_error("operation-failed"))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "DriftCheckUnavailable")
+        self.assertFalse(result["committed"])
+        order.lock.assert_not_called()
+        m.edit_config.assert_not_called()
+        m.commit.assert_not_called()
+
+    def test_unsupported_or_empty_render_fails_closed(self):
+        for render in ((None, "get-modelled-config-clis RPC not supported on this device"), (None, None)):
+            result, order, m = self._run(main._cli_hash(self.RENDER), render=render)
+            self.assertEqual(result["error_type"], "DriftCheckUnavailable")
+            order.lock.assert_not_called()
+            m.commit.assert_not_called()
+
+    def test_render_with_a_warning_but_text_still_checks_the_hash(self):
+        result, _, m = self._run(main._cli_hash(self.RENDER), render=(self.RENDER, "partial render"))
+        self.assertTrue(result["success"], result)
+        m.commit.assert_called_once()
+
+    def test_unprefixed_hash_uses_the_xml_path_as_before(self):
+        result, order, m = self._run(main._text_hash("<a>1</a>"))
+        self.assertTrue(result["success"], result)
+        order.render.assert_not_called()
+        order.read.assert_called_once_with(m, "running")
+        m.commit.assert_called_once()
+
+    def test_unprefixed_hash_mismatch_is_config_drift(self):
+        result, order, m = self._run("0123456789abcdef")
+        self.assertEqual(result["error_type"], "ConfigDrift")
+        order.render.assert_not_called()
+        order.lock.assert_not_called()
+        m.commit.assert_not_called()
+
+    def test_no_expect_hash_reads_nothing_before_the_lock(self):
+        result, order, m = self._run(None)
+        self.assertTrue(result["success"], result)
+        order.render.assert_not_called()
+        order.read.assert_not_called()
+
+    def test_nxos_push_with_unprefixed_hash_is_unchanged(self):
+        result, order, m = self._run(main._text_hash("<a>1</a>"), caps=[NXOS_CAP])
+        self.assertTrue(result["success"], result)
+        order.render.assert_not_called()
+        order.read.assert_called_once_with(m, "running")
+
+    def test_lock_failure_is_candidate_locked_and_nothing_is_committed(self):
+        for tag in ("lock-denied", "operation-failed"):
+            result, _, m = self._run(None, lock=_make_rpc_error(tag))
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error_type"], "CandidateLocked")
+            self.assertEqual(result["rpc_tag"], tag)
+            self.assertFalse(result["committed"])
+            m.discard_changes.assert_not_called()
+            m.edit_config.assert_not_called()
+            m.commit.assert_not_called()
 
 
 class SendConfigXmlTests(unittest.TestCase):

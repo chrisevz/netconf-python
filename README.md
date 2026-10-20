@@ -61,7 +61,7 @@ workflow, gateway or process still ends in a rollback. Results carry `persist_id
    locks candidate, discards any stray staged content, edits, and commits in one call. If
    `expect_running_hash` is set and running config has drifted since the preview captured
    its hash, the push is refused with `error_type=ConfigDrift` rather than applying an
-   approved diff against config that has since moved.
+   approved diff against config that has since moved (see "`expect_running_hash` drift guard").
 
 There is no separate stage-then-later-finish step. `config_xml` is generated upstream
 (Jinja2 or similar) once and used for both calls.
@@ -91,9 +91,9 @@ side-by-side view (old on the left, new on the right):
   changed lines plus 3 lines of context are returned, capped at 5000 rows. Changed blocks are paired line
   by line. Text is raw, not HTML-escaped: escaping is the job of whoever draws it.
 - `diff_stats`: `{"added", "removed", "truncated"}`.
-- `timings`: `running_render_s`, `candidate_render_s`, `render_wall_s` (time the main session spent in the render step: the candidate render plus any wait for the running render; equal to the candidate render when the running render had already finished), `parallel`, `steps` (seconds per phase: `connect`, `get_running_xml`, `get_candidate_xml`, `lock`, `edit_config`, `validate`, `render`, `discard_unlock`; plus `get_candidate_xml_after_edit`, which only appears in `"xml-diff"` mode and is already part of the `render` time) and `driver_total_s` (the script's own total, to compare with the task time in the workflow). The CLI render of
+- `timings`: `running_render_s`, `candidate_render_s`, `render_wall_s` (time the main session spent in the render step: the candidate render plus any wait for the running render; equal to the candidate render when the running render had already finished), `parallel`, `steps` (seconds per phase. IOS XE: `connect`, `lock`, `edit_config`, `validate`, `render`, `discard_unlock`; there are no `get_running_xml` / `get_candidate_xml` steps any more because the lock is taken first. In `"xml-diff"` mode `get_running_xml_after_edit` and `get_candidate_xml_after_edit` appear too, already part of the `render` time. On the dirty-candidate path (lock refused) `lock_refused`, `get_running_xml`, `get_candidate_xml` and, with `force_discard`, a second `lock` appear. NX-OS keeps `connect`, `get_running_xml`, `get_candidate_xml`, `lock`, `edit_config`, `validate`, `render`, `discard_unlock`, plus `get_candidate_xml_after_edit`) and `driver_total_s` (the script's own total, to compare with the task time in the workflow). The CLI render of
   running (a slow step) runs in a second read-only NETCONF session that starts right after the candidate
-  capability check, so it overlaps the two plain `get-config` reads and the staging work; the candidate
+  capability check, so it overlaps the staging work (lock, edit, validate); the candidate
   render follows the edit. If the second session cannot be opened or fails, running is rendered in the
   main session afterwards and `parallel` is `false`.
   Live measurement on a Catalyst 9500 stack (10-06, before this ordering): 220 s in total, of which the three
@@ -123,6 +123,11 @@ advertises the candidate datastore capability (parsed from the capability URN, n
 substring match). If present, both take an exclusive lock before touching candidate. If
 not, `netconf-send-command` edits `running` directly.
 
+If the lock cannot be taken (another session holds it past `lock_timeout`, or the device
+refuses it for another reason), both return `success=false`, `error_type=CandidateLocked`,
+the device's message in `error`, `rpc_tag`, `lock_wait_seconds` and `committed=false`.
+Nothing was edited or committed.
+
 | Flag | Default | Purpose |
 |---|---|---|
 | `--lock_timeout` | `30` | Max seconds to wait. `0` = fail immediately. |
@@ -131,28 +136,49 @@ not, `netconf-send-command` edits `running` directly.
 Lock-denied retries match on `error-tag == "lock-denied"` only — not on message-string
 sniffing, which was validated against exactly one 17.15 device and isn't guaranteed to
 hold on a different DMI build (e.g. IE 3400 on 17.12.4). Any other RPC error during lock
-acquisition is treated as fatal, not transient.
+acquisition is treated as fatal, not transient (reported as `CandidateLocked`, or, in the
+preview on IOS XE, first checked for a dirty candidate — see below).
 
 **Unverified, TODO:** whether `candidate-datastore` is available and enabled across all
 four platform families on both trains.
 
 ## Dirty-candidate handling
 
-Before staging anything, `netconf-preview-config` compares running vs candidate via plain
-`get-config` (not the CLI renderer — this check must work identically regardless of
-`preview_mode`). If they differ, another session has uncommitted work staged there:
+RFC 6241 §7.5: a lock on the candidate datastore MUST NOT be granted if it has uncommitted
+changes. Confirmed live on IOS XE 17.15 (`operation-failed`, "there are outstanding changes
+to the database"). So on IOS XE `netconf-preview-config` takes the lock FIRST: a granted lock
+proves the candidate is clean, and the two full `get-config` reads (running, candidate) that
+used to run before the edit are skipped.
 
-- Default: refused with `error_type=DirtyCandidate` and a `dirty_diff` showing what's there.
-- `force_discard=true`: discards it and proceeds. Discard happens before any lock is taken
-  (`discard-changes` needs no lock, RFC 6241 §8.3.4.2).
+If the lock is refused with a tag other than `lock-denied`, the preview runs the dirty check
+(plain `get-config` of running and candidate, compared):
+
+- Dirty, default: refused with `error_type=DirtyCandidate` and a `dirty_diff` showing what's there.
+- Dirty, `force_discard=true`: discards it (`discard-changes` needs no lock, RFC 6241 §8.3.4.2),
+  takes the lock again and proceeds.
+- Not dirty: `error_type=CandidateLocked` (the refusal had another cause).
+
+A `lock-denied` that outlasts `lock_timeout` means another session holds the lock: `CandidateLocked`
+straight away, no reads.
+
+NX-OS keeps the original order (not confirmed there): the dirty check first, with plain
+`get-config` reads, then the lock.
 
 ## `expect_running_hash` drift guard
 
-`running_hash` (from a preview call) and `expect_running_hash` (on the push call) are both
-fingerprints of the running-config XML (via plain `get-config`), not of a CLI render — this
-is what lets the drift guard work identically in both `preview_mode` outcomes. A push whose
-`expect_running_hash` doesn't match current running config is refused with
-`error_type=ConfigDrift`.
+`running_hash` (preview) and `expect_running_hash` (push) come in two forms, told apart by prefix:
+
+- `cli-sha256:<64 hex>` — IOS XE with a CLI render available (`preview_mode="device-rendered"`):
+  the sha256 of the normalized running CLI render the diff used. The preview does no full running
+  XML read for it. The push re-renders running in its own session (`get-modelled-config-clis`)
+  before taking the lock, hashes it with the same helper and compares. If the render is
+  unavailable or fails, the push is refused with `error_type=DriftCheckUnavailable` (fail closed;
+  no lock, edit or commit).
+- 16 hex chars, no prefix — the plain hash of the running-config XML: what the preview returns in
+  `preview_mode="xml-diff"` and on NX-OS, and what an older driver returned. The push compares it
+  against a fresh `get-config` of running, as before.
+
+A mismatch in either form is refused with `error_type=ConfigDrift`.
 
 ## Local development
 
@@ -183,7 +209,8 @@ python -m unittest test_main -v
 
 Offline, no device needed — covers text normalization/hashing, capability parsing,
 `preview_mode` selection (including the XML-diff fallback), the side-by-side diff rows, and the
-parallel render with its fallbacks.
+parallel render with its fallbacks, the lock-first preview (clean, dirty, force_discard, locked), the
+NX-OS call order, and the push drift guard (both hash forms, fail closed, `CandidateLocked`).
 
 ## Recommended inventory attributes
 
