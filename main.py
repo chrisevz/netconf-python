@@ -78,6 +78,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -262,6 +263,25 @@ def _read_version(m, platform: str) -> str:
     tree = _etree.fromstring(xml_str.encode() if isinstance(xml_str, str) else xml_str)
     nodes = tree.xpath(f".//*[local-name()='{local_name}']")
     return nodes[0].text.strip() if nodes and nodes[0].text else ""
+
+
+# Software trains (major.minor) on which the fast IOS XE preview (lock first, CLI-render fingerprint) has
+# been proven live. Anything else, or a failed version read, gets the original flow.
+FAST_PREVIEW_IOSXE_TRAINS = ("17.15",)
+
+
+def _fast_preview_allowed(m, platform: str) -> bool:
+    """True only for IOS XE on a train in FAST_PREVIEW_IOSXE_TRAINS, from the same small version read
+    is-alive uses. A failed or unparsable read, another platform or another train is False: the preview
+    then runs the original flow (dirty check first with full XML reads, plain XML hash)."""
+    if platform != "iosxe":
+        return False
+    try:
+        version = _read_version(m, "iosxe")
+    except Exception:
+        return False
+    found = re.match(r"\s*(\d+)\.(\d+)", version or "")
+    return bool(found) and f"{found.group(1)}.{found.group(2)}" in FAST_PREVIEW_IOSXE_TRAINS
 
 
 def is_alive(conn, args) -> dict:
@@ -677,7 +697,13 @@ def preview_config(conn, args) -> dict:
     """Stage a proposed config_xml change, diff it against running, and
     leave zero state on the device — all in one session.
 
-    Sequence on IOS XE (anything but NX-OS): the CLI render of running starts in
+    The sequence below is the "lock-first" flow. It runs only on IOS XE on a train in
+    FAST_PREVIEW_IOSXE_TRAINS (see _fast_preview_allowed); NX-OS, an undetected platform,
+    another train or a failed version read run the original flow (dirty check first with
+    full XML reads, plain XML hash, described last). Results carry dirty_check
+    ("lock-first" | "full-read") and fingerprint ("cli" | "xml").
+
+    Lock-first sequence: the CLI render of running starts in
     a second session -> lock candidate -> edit_config with the caller's
     config_xml -> validate (capability-gated, captured not raised) -> CLI render
     of candidate + diff against the running render -> discard_changes + unlock
@@ -701,7 +727,7 @@ def preview_config(conn, args) -> dict:
     away, no reads. Discarding stays gated on force_discard, never unconditional,
     or preview would silently destroy another session's pending work.
 
-    Sequence on NX-OS (unchanged, the lock-on-dirty behaviour is not confirmed
+    Original flow (NX-OS, and IOS XE outside the gate; lock-on-dirty is not confirmed
     there): get-config(running) -> get-config(candidate) -> dirty check (same
     DirtyCandidate / force_discard rules) -> lock candidate -> edit -> validate
     -> XML diff (no CLI render RPC) -> discard + unlock. running_hash is the
@@ -745,20 +771,26 @@ def preview_config(conn, args) -> dict:
             # (measured on a C9500 stack: ~36 s render).
             # get-modelled-config-clis is IOS XE only: on NX-OS skip the CLI render entirely
             # (no background session, no RPC) and go straight to the XML diff.
-            cli_render = _detect_platform(m) != "nxos"
+            platform = _detect_platform(m)
+            cli_render = platform != "nxos"
             background = _start_background_render(conn, "running") if cli_render else None
 
             # IOS XE: lock first. A granted lock proves the candidate is clean (RFC 6241 section 7.5), which
             # skips the two full get-config reads (~64 s + ~74 s on the lab switch). NX-OS keeps the dirty
             # check first (lock-on-dirty is not confirmed there).
-            lock_first = cli_render
+            # Only on a proven train (see FAST_PREVIEW_IOSXE_TRAINS); any other train, a failed version read
+            # or NX-OS runs the original order below.
+            lock_first = cli_render and _fast_preview_allowed(m, platform)
+            if platform == "iosxe":
+                steps.lap("version_read")
+            path = "lock-first" if lock_first else "full-read"
             running_xml = None
             lock_wait, lock_error = 0.0, None
             if lock_first:
                 lock_wait, lock_error = _try_candidate_lock(m, conn)
                 if lock_error is not None and getattr(lock_error, "tag", None) == "lock-denied":
                     # another session holds the lock and did not let go within lock_timeout
-                    return _candidate_locked_result(conn, device_name, lock_error, lock_wait)
+                    return dict(_candidate_locked_result(conn, device_name, lock_error, lock_wait), dirty_check=path)
                 steps.lap("lock" if lock_error is None else "lock_refused")
 
             if not lock_first or lock_error is not None:
@@ -783,6 +815,7 @@ def preview_config(conn, args) -> dict:
                                      "force_discard=true to discard it and proceed.",
                             "error_type": "DirtyCandidate",
                             "dirty_diff": dirty_diff,
+                            "dirty_check": path,
                             "committed": False,
                         }
                     # force_discard=true: clear it now — discard-changes requires no lock
@@ -793,17 +826,18 @@ def preview_config(conn, args) -> dict:
                         # the refused lock is retried now that the candidate is clean
                         lock_wait, lock_error = _try_candidate_lock(m, conn)
                         if lock_error is not None:
-                            return _candidate_locked_result(conn, device_name, lock_error, lock_wait)
+                            return dict(_candidate_locked_result(conn, device_name, lock_error, lock_wait), dirty_check=path)
                         steps.lap("lock")
                 elif lock_error is not None:
                     # candidate is clean, so the refusal had another cause: report it, edit nothing
-                    return _candidate_locked_result(conn, device_name, lock_error, lock_wait)
+                    return dict(_candidate_locked_result(conn, device_name, lock_error, lock_wait), dirty_check=path)
 
             if not lock_first:
                 lock_wait, lock_error = _try_candidate_lock(m, conn)
                 if lock_error is not None:
-                    return _candidate_locked_result(conn, device_name, lock_error, lock_wait)
+                    return dict(_candidate_locked_result(conn, device_name, lock_error, lock_wait), dirty_check=path)
                 steps.lap("lock")
+
             edited = False
             result = None
             try:
@@ -846,8 +880,10 @@ def preview_config(conn, args) -> dict:
                 # Fingerprint of the running config the diff was made against. With the CLI render it is the
                 # hash of that render (the same helper the push re-checks with); with the XML-diff fallback it
                 # is the plain XML hash. Either way it is of the text this preview diffed.
-                if render["preview_mode"] == "device-rendered":
+                if lock_first and render["preview_mode"] == "device-rendered":
                     running_hash = _cli_hash(render["running_config"])
+                elif running_xml is not None:
+                    running_hash = _text_hash(running_xml)
                 else:
                     running_hash = _text_hash(render["running_config"])
                 if not include_diff:
@@ -871,6 +907,10 @@ def preview_config(conn, args) -> dict:
                     "candidate_config": render["candidate_config"],
                     "running_config": render["running_config"],
                     "running_hash": running_hash,
+                    # which path ran: "lock-first" (no pre-edit XML reads) or "full-read" (dirty check
+                    # first); and what running_hash fingerprints: the CLI render or the running XML
+                    "dirty_check": path,
+                    "fingerprint": "cli" if running_hash.startswith(_CLI_HASH_PREFIX) else "xml",
                     "warning": render["render_warning"],
                     # how long each CLI render took and whether the two ran at the same time, plus where
                     # the whole call spent its time (steps) and the driver's own total in seconds
@@ -943,6 +983,7 @@ def send_command(conn, args) -> dict:
 
     try:
         with _session(conn) as m:
+            drift_check = "none"
             if expect_running_hash:
                 # Drift guard: caller captured running_hash from an earlier
                 # netconf-preview-config call and wants to be sure nothing else
@@ -952,7 +993,8 @@ def send_command(conn, args) -> dict:
                 # running CLI render (the usual IOS XE preview), anything else is
                 # the plain XML hash (XML-diff fallback, NX-OS, or a preview made
                 # by an older driver).
-                if expect_running_hash.startswith(_CLI_HASH_PREFIX):
+                drift_check = "cli" if expect_running_hash.startswith(_CLI_HASH_PREFIX) else "xml"
+                if drift_check == "cli":
                     try:
                         running_clis, render_error = _get_modelled_config_clis(m, "running")
                     except Exception as e:
@@ -967,6 +1009,7 @@ def send_command(conn, args) -> dict:
                                      f"(expect_running_hash is a CLI-render hash) — refusing to apply: "
                                      f"{render_error or 'empty render'}",
                             "error_type": "DriftCheckUnavailable",
+                            "drift_check": drift_check,
                             "committed": False,
                         }
                     actual_hash = _cli_hash(running_clis)
@@ -980,6 +1023,7 @@ def send_command(conn, args) -> dict:
                         "device_name": device_name,
                         "error": "running config has drifted since expect_running_hash was captured — refusing to apply",
                         "error_type": "ConfigDrift",
+                        "drift_check": drift_check,
                         "expected_running_hash": expect_running_hash,
                         "actual_running_hash": actual_hash,
                     }
@@ -1001,7 +1045,7 @@ def send_command(conn, args) -> dict:
 
             lock_wait, lock_error = _try_candidate_lock(m, conn)
             if lock_error is not None:
-                return _candidate_locked_result(conn, device_name, lock_error, lock_wait)
+                return dict(_candidate_locked_result(conn, device_name, lock_error, lock_wait), drift_check=drift_check)
             try:
                 # IOS XE's candidate is a single global datastore, not per-session.
                 # The lock grants exclusive write access; it does NOT guarantee an
@@ -1027,6 +1071,7 @@ def send_command(conn, args) -> dict:
                             "device_name": device_name,
                             "error": f"candidate failed validation — not committed: {e}",
                             "error_type": "ValidationFailed",
+                            "drift_check": drift_check,
                             "rpc_tag": getattr(e, "tag", None),
                             "rpc_path": getattr(e, "path", None),
                             "committed": False,
@@ -1053,6 +1098,7 @@ def send_command(conn, args) -> dict:
                     "validate": validate_result,
                     "commit": getattr(commit_reply, "xml", str(commit_reply)),
                     "confirmed_commit": bool(confirm_timeout),
+                    "drift_check": drift_check,
                 }
                 if confirm_timeout:
                     result.update({
@@ -1072,6 +1118,7 @@ def send_command(conn, args) -> dict:
                     "device_name": device_name,
                     "error": str(inner),
                     "error_type": type(inner).__name__,
+                    "drift_check": drift_check,
                 }
                 if confirm_timeout:
                     # If the commit reply was lost after the device applied it, the

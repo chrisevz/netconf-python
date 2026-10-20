@@ -142,6 +142,19 @@ preview on IOS XE, first checked for a dirty candidate — see below).
 **Unverified, TODO:** whether `candidate-datastore` is available and enabled across all
 four platform families on both trains.
 
+## Fast preview gate and path labels
+
+The lock-first preview and the CLI-render fingerprint run only when the platform is detected as IOS XE
+(`iosxe`, from the hello) AND the software train (major.minor, from the same small version read
+`netconf-is-alive` uses) is in `FAST_PREVIEW_IOSXE_TRAINS` in `main.py`, initially `("17.15",)`, the one
+train proven live. NX-OS, an undetected platform, another train, or a failed or unparsable version read
+all run the original flow: dirty check first with full `get-config` reads, then the lock, plain XML hash.
+
+Results say which path ran (add-only fields):
+- Preview: `dirty_check` is `"lock-first"` or `"full-read"`; `fingerprint` (success only) is `"cli"` or `"xml"`.
+- Push: `drift_check` is `"cli"`, `"xml"` or `"none"` (no `expect_running_hash`).
+The preview adds a `version_read` step to `timings.steps` on IOS XE.
+
 ## Dirty-candidate handling
 
 RFC 6241 §7.5: a lock on the candidate datastore MUST NOT be granted if it has uncommitted

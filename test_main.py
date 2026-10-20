@@ -315,17 +315,22 @@ class PreviewConfigFlowTests(unittest.TestCase):
     """preview_config end to end with a mocked manager: ordering and result shape."""
 
     def _run(self, diff=True, render_supported=True, reads=None, lock=None, force_discard=False,
-             edit_error=None):
-        """reads: values for the mocked _get_config_xml (default: the two XML reads only an XML diff needs,
-        running then candidate after the edit). lock: side_effect for _acquire_candidate_lock."""
+             edit_error=None, version="17.15.4", validate_error=None, candidate_render="hostname a\ndescription new\n"):
+        """version: what the mocked version read returns (an Exception instance makes the read fail); the
+        default is on the allow-listed train, so the fast flow runs. reads: values for the mocked
+        _get_config_xml; the default answers by source (running "<a>1</a>"; candidate "<a>1</a>" before the
+        edit and "<a>2</a>" after it). lock: side_effect for _acquire_candidate_lock."""
         m = MagicMock()
-        m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0"]
+        m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0", IOSXE_CAP,
+                                 "urn:ietf:params:netconf:capability:validate:1.1"]
         if edit_error is not None:
             m.edit_config.side_effect = edit_error
+        if validate_error is not None:
+            m.validate.side_effect = validate_error
         order = MagicMock()
         thread = MagicMock()
         if render_supported:
-            m.dispatch.side_effect = [PreviewRenderTests._fake_reply("hostname a\ndescription new\n")]
+            m.dispatch.side_effect = [PreviewRenderTests._fake_reply(candidate_render)]
             box = {"result": "hostname a\ndescription old\n", "error": None, "exc": None, "seconds": 2.0}
         else:
             m.dispatch.side_effect = _make_rpc_error()
@@ -337,12 +342,22 @@ class PreviewConfigFlowTests(unittest.TestCase):
         order.lock.return_value = 0.0
         if lock is not None:
             order.lock.side_effect = lock
-        order.read.side_effect = reads if reads is not None else ["<a>1</a>", "<a>2</a>"]
+        if reads is not None:
+            order.read.side_effect = reads
+        else:
+            def read(mm, source, *a):
+                if source == "running":
+                    return "<a>1</a>"
+                return "<a>2</a>" if m.edit_config.called else "<a>1</a>"
+            order.read.side_effect = read
         conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
         args = MagicMock(config_xml="<config/>", force_discard=force_discard, diff=diff)
+        version_read = MagicMock(side_effect=version if isinstance(version, Exception) else None,
+                                 return_value=version)
         with patch.object(main, "_session", return_value=session), \
              patch.object(main, "_start_background_render", order.start), \
              patch.object(main, "_acquire_candidate_lock", order.lock), \
+             patch.object(main, "_read_version", version_read), \
              patch.object(main, "_get_config_xml", order.read):
             result = main.preview_config(conn, args)
         return result, order, m
@@ -486,6 +501,142 @@ class PreviewConfigFlowTests(unittest.TestCase):
         self.assertIsNone(result["diff_stats"])
 
 
+class FastPreviewGateTests(unittest.TestCase):
+    """The lock-first preview runs only on IOS XE on an allow-listed train; everything else is today's flow."""
+
+    @staticmethod
+    def _names(order):
+        return [c[0] for c in order.mock_calls if c[0] in ("start", "read", "lock")]
+
+    def test_allow_list_is_exactly_the_proven_train(self):
+        self.assertEqual(main.FAST_PREVIEW_IOSXE_TRAINS, ("17.15",))
+
+    def test_gate_matches_major_minor_only(self):
+        m = MagicMock()
+        for version, expected in (("17.15.4", True), ("17.15.5a", True), ("17.15", True), ("17.12.4", False),
+                                  ("17.150.1", False), ("117.15.1", False), ("", False), ("garbage", False),
+                                  (None, False)):
+            with patch.object(main, "_read_version", return_value=version):
+                self.assertEqual(main._fast_preview_allowed(m, "iosxe"), expected, version)
+
+    def test_gate_is_false_for_other_platforms_without_reading_the_version(self):
+        for platform in ("nxos", "unknown"):
+            with patch.object(main, "_read_version") as read:
+                self.assertFalse(main._fast_preview_allowed(MagicMock(), platform))
+            read.assert_not_called()
+
+    def test_gate_is_false_when_the_version_read_fails(self):
+        with patch.object(main, "_read_version", side_effect=RuntimeError("boom")):
+            self.assertFalse(main._fast_preview_allowed(MagicMock(), "iosxe"))
+
+    def test_17_15_takes_the_fast_path(self):
+        result, order, _ = PreviewConfigFlowTests()._run(version="17.15.4")
+        self.assertEqual(self._names(order), ["start", "lock"])
+        self.assertEqual(result["dirty_check"], "lock-first")
+        self.assertEqual(result["fingerprint"], "cli")
+
+    def test_another_train_runs_todays_flow_call_for_call(self):
+        result, order, m = PreviewConfigFlowTests()._run(version="17.12.4")
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self._names(order), ["start", "read", "read", "lock"])
+        self.assertEqual([c.args[1] for c in order.read.call_args_list], ["running", "candidate"])
+        self.assertEqual(result["dirty_check"], "full-read")
+        self.assertEqual(result["fingerprint"], "xml")
+        self.assertEqual(result["running_hash"], main._text_hash("<a>1</a>"))
+        self.assertEqual(result["preview_mode"], "device-rendered")
+        for name in ("get_running_xml", "get_candidate_xml"):
+            self.assertIn(name, result["timings"]["steps"])
+
+    def test_another_train_with_xml_diff_reads_three_times_as_before(self):
+        result, order, _ = PreviewConfigFlowTests()._run(version="17.12.4", render_supported=False)
+        self.assertEqual([c.args[1] for c in order.read.call_args_list], ["running", "candidate", "candidate"])
+        self.assertEqual(result["running_hash"], main._text_hash("<a>1</a>"))
+
+    def test_another_train_dirty_candidate_is_refused_before_the_lock(self):
+        result, order, _ = PreviewConfigFlowTests()._run(version="17.12.4", reads=["<a>1</a>", "<a>9</a>"])
+        self.assertEqual(result["error_type"], "DirtyCandidate")
+        self.assertEqual(self._names(order), ["start", "read", "read"])
+        order.lock.assert_not_called()
+
+    def test_version_read_error_runs_todays_flow(self):
+        result, order, _ = PreviewConfigFlowTests()._run(version=RuntimeError("read failed"))
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self._names(order), ["start", "read", "read", "lock"])
+        self.assertEqual(result["dirty_check"], "full-read")
+        self.assertEqual(result["fingerprint"], "xml")
+
+    def test_unparsable_version_runs_todays_flow(self):
+        result, order, _ = PreviewConfigFlowTests()._run(version="")
+        self.assertEqual(self._names(order), ["start", "read", "read", "lock"])
+
+    def test_unknown_platform_runs_todays_flow_without_a_version_read(self):
+        # no IOS XE / NX-OS module in the hello: platform "unknown", so no fast path even on "17.15"
+        m = MagicMock()
+        m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0"]
+        self.assertEqual(main._detect_platform(m), "unknown")
+        with patch.object(main, "_read_version", return_value="17.15.4") as read:
+            self.assertFalse(main._fast_preview_allowed(m, main._detect_platform(m)))
+        read.assert_not_called()
+
+    def test_nxos_never_reads_the_version_and_runs_todays_flow(self):
+        order = NxosPreviewOrderTests()
+        with patch.object(main, "_read_version") as read:
+            result, _ = order._run(["<a>1</a>", "<a>1</a>", "<a>2</a>"])
+        read.assert_not_called()
+        self.assertEqual(result["dirty_check"], "full-read")
+        self.assertEqual(result["fingerprint"], "xml")
+
+
+class FastVersusTodaysFlowEquivalenceTests(unittest.TestCase):
+    """For the same mocked device and config_xml the fast flow and today's flow must agree on everything the
+    operator sees; only running_hash, timings and the two path labels may differ."""
+
+    SAME = ("success", "valid", "validate", "has_changes", "diff", "diff_rows", "diff_stats", "preview_mode",
+            "candidate_config", "running_config", "warning", "committed")
+
+    def _both(self, **kw):
+        fast, _, mf = PreviewConfigFlowTests()._run(version="17.15.4", **kw)
+        slow, _, ms = PreviewConfigFlowTests()._run(version="17.12.4", **kw)
+        self.assertEqual(fast["dirty_check"], "lock-first")
+        self.assertEqual(slow["dirty_check"], "full-read")
+        for result, mm in ((fast, mf), (slow, ms)):
+            mm.commit.assert_not_called()
+            mm.unlock.assert_called_once_with(target="candidate")
+            mm.discard_changes.assert_called()
+        return fast, slow
+
+    def _assert_equivalent(self, fast, slow, hash_differs=True):
+        for key in self.SAME:
+            self.assertEqual(fast[key], slow[key], key)
+        self.assertEqual(set(fast) - {"timings"}, set(slow) - {"timings"})
+        if hash_differs:
+            self.assertNotEqual(fast["running_hash"], slow["running_hash"])
+
+    def test_changes_present(self):
+        fast, slow = self._both()
+        self._assert_equivalent(fast, slow)
+        self.assertTrue(fast["has_changes"])
+        self.assertEqual(fast["validate"], "valid")
+
+    def test_no_changes(self):
+        fast, slow = self._both(candidate_render="hostname a\ndescription old\n")
+        self._assert_equivalent(fast, slow)
+        self.assertFalse(fast["has_changes"])
+        self.assertEqual(fast["diff"], "")
+
+    def test_validation_failure(self):
+        fast, slow = self._both(validate_error=_make_rpc_error("invalid-value"))
+        self._assert_equivalent(fast, slow)
+        self.assertFalse(fast["valid"])
+
+    def test_xml_diff_mode(self):
+        fast, slow = self._both(render_supported=False)
+        self._assert_equivalent(fast, slow, hash_differs=False)
+        self.assertEqual(fast["preview_mode"], "xml-diff")
+        # without a CLI render both flows fingerprint the running XML the same way
+        self.assertEqual(fast["running_hash"], slow["running_hash"])
+
+
 class GetConfigXmlPlatformFilterTests(unittest.TestCase):
     """An unfiltered read gets the NX-OS root filter on NX-OS only."""
 
@@ -627,6 +778,15 @@ class PushDriftGuardTests(unittest.TestCase):
              patch.object(main, "_get_config_xml", order.read), \
              patch.object(main, "_acquire_candidate_lock", order.lock):
             return main.send_command(conn, args), order, m
+
+    def test_drift_check_label(self):
+        self.assertEqual(self._run(main._cli_hash(self.RENDER))[0]["drift_check"], "cli")
+        self.assertEqual(self._run(main._text_hash("<a>1</a>"))[0]["drift_check"], "xml")
+        self.assertEqual(self._run(None)[0]["drift_check"], "none")
+        self.assertEqual(self._run("0123456789abcdef")[0]["drift_check"], "xml")
+        self.assertEqual(self._run(main._cli_hash("x"))[0]["drift_check"], "cli")
+        self.assertEqual(self._run(main._cli_hash(self.RENDER), render_exc=RuntimeError("x"))[0]["drift_check"], "cli")
+        self.assertEqual(self._run(None, lock=_make_rpc_error("lock-denied"))[0]["drift_check"], "none")
 
     def test_matching_cli_hash_proceeds_and_commits(self):
         result, order, m = self._run(main._cli_hash(self.RENDER))
