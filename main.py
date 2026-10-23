@@ -1373,7 +1373,8 @@ def save_config(conn, args) -> dict:
 # Interface types checked for leftover configuration: every physical type plus
 # Port-channel. SVIs and Loopbacks are not part of the check.
 _CHECK_PHYSICAL_TYPES = ("GigabitEthernet", "TwoGigabitEthernet", "FiveGigabitEthernet",
-                         "TenGigabitEthernet", "TwentyFiveGigE", "FortyGigabitEthernet", "HundredGigE")
+                         "TenGigabitEthernet", "TwentyFiveGigE", "FortyGigabitEthernet", "HundredGigE",
+                         "AppGigabitEthernet")
 
 _EXISTING_CONFIG_FILTER = (
     '<native xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-native">'
@@ -1436,6 +1437,7 @@ def _interface_findings(native) -> list:
             for group in _kids(port, "channel-group"):
                 numbers = [_text(n) for n in _kids(group, "number")]
                 notes.append(f"channel-group {numbers[0]}" if numbers and numbers[0] else "channel-group")
+            notes = list(dict.fromkeys(notes))   # the device returns the new and the legacy switchport tree
             if notes:
                 findings.append(f"{name}: {', '.join(notes)}")
     return findings

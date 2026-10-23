@@ -1434,6 +1434,17 @@ class ExistingConfigCheckTests(unittest.TestCase):
         self.assertTrue(result["found"])
         self.assertIn("FortyGigabitEthernet1/0/5: access VLAN 30", result["findings"][0])
 
+    def test_new_and_legacy_switchport_trees_give_one_finding(self):
+        new = f'<switchport-config><switchport>{_access(999)}</switchport-config>'.replace("</switchport-config>", "</switchport></switchport-config>")
+        legacy = f'<switchport><access xmlns="{_SW}"><vlan><vlan>999</vlan></vlan></access></switchport>'
+        port = f"<FortyGigabitEthernet><name>1/0/7</name>{new}{legacy}<shutdown/></FortyGigabitEthernet>"
+        result, _ = self._check(_native(port))
+        self.assertEqual(result["findings"], ["FortyGigabitEthernet1/0/7: access VLAN 999, mode access"])
+
+    def test_app_gigabit_port_counts(self):
+        result, _ = self._check(_native(_port("AppGigabitEthernet", "1/0/1", _access(30))))
+        self.assertTrue(result["found"])
+
     def test_vlan_1_only_not_found(self):
         sp = f'<access xmlns="{_SW}"><vlan><vlan>1</vlan></vlan></access>'
         result, _ = self._check(_native(_port("GigabitEthernet", "1/0/2", sp)))
