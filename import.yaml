@@ -175,38 +175,6 @@ decorators:
           default: 90
       additionalProperties: false
 
-  - name: netconf-save-config-input
-    schema:
-      $schema: https://json-schema.org/draft/2020-12/schema
-      title: netconf-save-config inputs
-      type: object
-      properties:
-        backup_filesystem:
-          description: >-
-            Optional. If set, copy running-config to a timestamped file
-            (<filesystem>:backup-YYYYMMDD-HHMMSS, UTC) instead of saving to
-            startup-config; the startup-config is not touched and the file URL is
-            returned as destination. Empty = the normal save to startup.
-          type: string
-          enum: ["", flash, bootflash]
-        timeout:
-          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
-          type: integer
-          default: 90
-      additionalProperties: true
-
-  - name: netconf-existing-config-check-input
-    schema:
-      $schema: https://json-schema.org/draft/2020-12/schema
-      title: netconf-existing-config-check inputs
-      type: object
-      properties:
-        timeout:
-          description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
-          type: integer
-          default: 90
-      additionalProperties: false
-
 services:
   - name: netconf-is-alive
     type: python-script
@@ -295,33 +263,13 @@ services:
       Cisco IOS XE NETCONF — copy running-config to startup-config (write
       memory) so a committed change survives a reload. Tries cisco-ia
       save-config, then Cisco-IOS-XE-rpc copy; reports which method worked.
-      Saves the whole running config, not just the last change. With
-      backup_filesystem (flash or bootflash) it instead copies running-config
-      to <filesystem>:backup-<UTC timestamp> and returns the file as destination.
+      Saves the whole running config, not just the last change.
     repository: netconf-python
     filename: main.py
-    decorator: netconf-save-config-input
+    decorator: netconf-common-input
     runtime:
       env:
         NETCONF_OP: netconf-save-config
-    tags: [driver, iosxe, netconf, cisco]
-
-  - name: netconf-existing-config-check
-    type: python-script
-    description: >-
-      Cisco IOS XE NETCONF — read-only check whether a device already carries
-      configuration: a port with an access VLAN other than 1, a switchport mode,
-      a trunk allowed list or a channel-group, any Port-channel, AAA, or a
-      TACACS server. One get-config of running with a narrow filter; no lock, no
-      candidate. Returns only found, findings (short lines, capped) and
-      findings_total, never the raw config or any key. NX-OS returns
-      error_type=NotSupported.
-    repository: netconf-python
-    filename: main.py
-    decorator: netconf-existing-config-check-input
-    runtime:
-      env:
-        NETCONF_OP: netconf-existing-config-check
     tags: [driver, iosxe, netconf, cisco]
 
   - name: netconf-confirm-commit
