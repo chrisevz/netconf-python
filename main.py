@@ -13,7 +13,8 @@ work resumes later.
 
 Actions: netconf-is-alive, netconf-get-config, netconf-get-config-clis,
 netconf-preview-config, netconf-send-command, netconf-discard,
-netconf-save-config, netconf-confirm-commit, netconf-cancel-commit.
+netconf-save-config, netconf-confirm-commit, netconf-cancel-commit,
+netconf-existing-config-check.
 
 netconf-preview-config is the core feature: it stages a proposed config_xml
 change into the candidate datastore, renders/diffs it against running, and
@@ -1277,12 +1278,66 @@ _NXOS_SAVE_CONFIG_RPCS = [
 ]
 
 
+_BACKUP_FILESYSTEMS = ("flash", "bootflash")
+
+
+def _backup_filesystem(args):
+    """The optional backup_filesystem argument, or None when unset/empty."""
+    value = getattr(args, "backup_filesystem", None)
+    return value if isinstance(value, str) and value != "" else None
+
+
+def _backup_config(conn, device_name, filesystem) -> dict:
+    """Copy running-config to <filesystem>:backup-<UTC YYYYMMDD-HHMMSS> with the
+    Cisco-IOS-XE-rpc copy RPC (no cisco-ia path: it can only write startup).
+    The startup-config is not touched."""
+    destination = f"{filesystem}:backup-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    rpc_xml = ('<copy xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-rpc">'
+               "<source-drop-node-name>running-config</source-drop-node-name>"
+               f"<destination-drop-node-name>{destination}</destination-drop-node-name>"
+               "</copy>")
+    try:
+        with _session(conn) as m:
+            if _detect_platform(m) == "nxos":
+                return {"success": False, "host": conn["host"], "device_name": device_name,
+                        "error": "backup_filesystem is not supported on NX-OS",
+                        "error_type": "NotSupported"}
+            reply = m.dispatch(to_ele(rpc_xml))
+            xml_str = reply.xml if hasattr(reply, "xml") else str(reply)
+            tree = _etree.fromstring(xml_str.encode() if isinstance(xml_str, str) else xml_str)
+            result_nodes = tree.xpath(".//*[local-name()='result']")
+            return {
+                "success": True,
+                "host": conn["host"],
+                "device_name": device_name,
+                "method": "Cisco-IOS-XE-rpc:copy",
+                "destination": destination,
+                "result": result_nodes[0].text.strip() if result_nodes and result_nodes[0].text else None,
+            }
+    except RPCError as e:
+        return dict(_rpc_failure(conn, device_name, e), destination=destination)
+    except Exception as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": str(e), "error_type": type(e).__name__, "destination": destination}
+
+
 def save_config(conn, args) -> dict:
     """Persist running-config to startup-config (NETCONF equivalent of
     `write memory`). A committed change only reaches running; without this a
     reload silently reverts it. Saves the WHOLE running config, not just the
-    last change."""
+    last change.
+
+    With backup_filesystem (flash or bootflash) set it instead copies running
+    to a timestamped file on that filesystem and leaves startup alone; the
+    file URL comes back as `destination`."""
     device_name = conn.get("device_name") or conn["host"]
+    backup_fs = _backup_filesystem(args)
+    if backup_fs is not None:
+        if backup_fs not in _BACKUP_FILESYSTEMS:
+            return {"success": False, "host": conn["host"], "device_name": device_name,
+                    "error": f"backup_filesystem must be one of {list(_BACKUP_FILESYSTEMS)}, got {backup_fs!r}",
+                    "error_type": "InvalidBackupFilesystem"}
+        return _backup_config(conn, device_name, backup_fs)
     attempts = []
     try:
         with _session(conn) as m:
@@ -1313,6 +1368,131 @@ def save_config(conn, args) -> dict:
             "error_type": "SaveUnsupported", "failed_attempts": attempts}
 
 
+
+
+# Interface types checked for leftover configuration: every physical type plus
+# Port-channel. SVIs and Loopbacks are not part of the check.
+_CHECK_PHYSICAL_TYPES = ("GigabitEthernet", "TwoGigabitEthernet", "FiveGigabitEthernet",
+                         "TenGigabitEthernet", "TwentyFiveGigE", "FortyGigabitEthernet", "HundredGigE")
+
+_EXISTING_CONFIG_FILTER = (
+    '<native xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-native">'
+    "<interface>"
+    + "".join(f"<{t}><name/><switchport-config/><channel-group/><vrf/></{t}>" for t in _CHECK_PHYSICAL_TYPES)
+    + "<Port-channel><name/></Port-channel>"
+    "</interface>"
+    "<aaa/>"
+    "<tacacs><server><name/></server></tacacs>"
+    "</native>"
+)
+
+_FINDINGS_MAX = 20
+
+
+def _ln(el) -> str:
+    return _etree.QName(el).localname if isinstance(el.tag, str) else ""
+
+
+def _kids(el, name):
+    return [c for c in el if _ln(c) == name]
+
+
+def _text(el) -> str:
+    return (el.text or "").strip() if el is not None else ""
+
+
+def _interface_findings(native) -> list:
+    """One short line per physical port that carries access/trunk/channel-group
+    configuration, plus one per Port-channel. The out-of-band management port
+    (GigabitEthernet0/0, or whatever sits in Mgmt-vrf) is skipped. Only VLAN
+    numbers, modes and the channel number are read, never anything else."""
+    findings = []
+    for interface in _kids(native, "interface"):
+        for port in interface:
+            kind = _ln(port)
+            if kind not in _CHECK_PHYSICAL_TYPES and kind != "Port-channel":
+                continue
+            name = f"{kind}{_text((_kids(port, 'name') or [None])[0])}"
+            if kind == "Port-channel":
+                findings.append(name)
+                continue
+            vrfs = [_text(f) for v in _kids(port, "vrf") for f in _kids(v, "forwarding")]
+            if name == "GigabitEthernet0/0" or "Mgmt-vrf" in vrfs:
+                continue
+            notes = []
+            for sw in port.iter():
+                if _ln(sw) != "switchport":
+                    continue
+                for vlan in sw.xpath("./*[local-name()='access']/*[local-name()='vlan']/*[local-name()='vlan']"):
+                    if _text(vlan) and _text(vlan) != "1":
+                        notes.append(f"access VLAN {_text(vlan)}")
+                for mode in _kids(sw, "mode"):
+                    for m_ in mode:
+                        if _ln(m_) in ("access", "trunk"):
+                            notes.append(f"mode {_ln(m_)}")
+                for allowed in sw.xpath("./*[local-name()='trunk']/*[local-name()='allowed']"):
+                    vlans = [_text(v) for v in allowed.iter() if _ln(v) == "vlans" and _text(v)]
+                    notes.append(f"trunk allowed VLANs {','.join(vlans)}" if vlans else "trunk allowed VLANs")
+            for group in _kids(port, "channel-group"):
+                numbers = [_text(n) for n in _kids(group, "number")]
+                notes.append(f"channel-group {numbers[0]}" if numbers and numbers[0] else "channel-group")
+            if notes:
+                findings.append(f"{name}: {', '.join(notes)}")
+    return findings
+
+
+def _aaa_findings(native) -> list:
+    findings = []
+    for aaa in _kids(native, "aaa"):
+        for child in aaa:
+            kind = _ln(child)
+            if kind == "new-model":
+                findings.append("AAA: aaa new-model")
+            elif kind in ("authentication", "authorization", "accounting"):
+                findings.append(f"AAA: {kind}")
+            elif kind == "group":
+                findings.append("AAA: group server")
+    return findings
+
+
+def _tacacs_findings(native) -> list:
+    servers = [s for t in _kids(native, "tacacs") for s in _kids(t, "server")]
+    return [f"TACACS servers: {len(servers)}"] if servers else []
+
+
+def existing_config_check(conn, args) -> dict:
+    """Read-only check for configuration already on a staged device: a port with
+    an access VLAN other than 1, a switchport mode, a trunk allowed list or a
+    channel-group, any Port-channel, any AAA, any TACACS server. One get-config
+    of running with a narrow subtree filter; no lock, no candidate. The config is
+    evaluated here and only a short summary leaves: never the raw config, and
+    never a key or secret value (the filter does not even ask for them).
+
+    `found` is True when anything above exists; `findings` is capped, with the
+    full count in `findings_total`. IOS XE only."""
+    device_name = conn.get("device_name") or conn["host"]
+    try:
+        with _session(conn) as m:
+            if _detect_platform(m) == "nxos":
+                return {"success": False, "host": conn["host"], "device_name": device_name,
+                        "error": "existing-config check is not supported on NX-OS",
+                        "error_type": "NotSupported"}
+            reply = m.get_config(source="running", filter=("subtree", _EXISTING_CONFIG_FILTER))
+            tree = _etree.fromstring(reply.data_xml.encode())
+    except RPCError as e:
+        return _rpc_failure(conn, device_name, e)
+    except Exception as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": str(e), "error_type": type(e).__name__}
+    findings = []
+    for native in tree.iter():
+        if _ln(native) == "native":
+            findings += _interface_findings(native) + _aaa_findings(native) + _tacacs_findings(native)
+    return {"success": True, "host": conn["host"], "device_name": device_name,
+            "found": bool(findings), "findings": findings[:_FINDINGS_MAX],
+            "findings_total": len(findings)}
+
+
 _DISPATCH = {
     "netconf-is-alive": is_alive,
     "netconf-get-config": get_config,
@@ -1321,6 +1501,7 @@ _DISPATCH = {
     "netconf-send-command": send_command,
     "netconf-discard": discard,
     "netconf-save-config": save_config,
+    "netconf-existing-config-check": existing_config_check,
     "netconf-confirm-commit": confirm_commit,
     "netconf-cancel-commit": cancel_commit,
 }
@@ -1439,6 +1620,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--persist_id", "--persist-id", dest="persist_id", default=None,
                         help="netconf-confirm-commit / netconf-cancel-commit — the persist_id "
                              "returned by the netconf-send-command call that started the confirmed commit.")
+    parser.add_argument("--backup_filesystem", "--backup-filesystem", dest="backup_filesystem", default=None,
+                        help="netconf-save-config only — flash or bootflash. If set, copy running-config to "
+                             "<filesystem>:backup-<UTC timestamp> instead of saving to startup.")
     parser.add_argument("--source", "--datastore", dest="source", default=None)
     parser.add_argument("--filter", default=None)
     return parser
@@ -1446,7 +1630,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _normalize_args(args):
     for attr in ("source", "filter", "host", "user", "password", "config_xml", "expect_running_hash",
-                 "persist_id"):
+                 "persist_id", "backup_filesystem"):
         if getattr(args, attr, None) == "":
             setattr(args, attr, None)
 
