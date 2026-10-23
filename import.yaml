@@ -193,7 +193,7 @@ decorators:
           description: Seconds to wait for the NETCONF connection/RPC reply. Defaults to 90.
           type: integer
           default: 90
-      additionalProperties: false
+      additionalProperties: true
 
   - name: netconf-existing-config-check-input
     schema:

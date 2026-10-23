@@ -1351,6 +1351,24 @@ class SaveConfigBackupTests(unittest.TestCase):
             self.assertNotIn("destination", result)
             self.assertIn("cisco-ia", m.dispatch.call_args.args[0].tag)
 
+    def _backup_with_result(self, text):
+        r = MagicMock()
+        r.xml = ('<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+                 f'<result xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-rpc">{text}</result></rpc-reply>')
+        return self._run("flash", [r])[0]
+
+    def test_backup_result_text_with_error_or_fail_is_a_failure(self):
+        for text in ("%Error opening flash:backup (No space left on device)", "Copy FAILED", "copy failure"):
+            result = self._backup_with_result(text)
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error_type"], "BackupFailed")
+            self.assertEqual(result["error"], text)
+            self.assertRegex(result["destination"], r"^flash:backup-")
+
+    def test_backup_result_ok_text_is_a_success(self):
+        for text in ("[OK]", "Copy in progress...", ""):
+            self.assertTrue(self._backup_with_result(text)["success"])
+
     def test_nxos_backup_not_supported(self):
         result, m, _ = self._run("flash", capabilities=[NXOS_CAP])
         self.assertFalse(result["success"])
@@ -1381,6 +1399,10 @@ _SW = "http://cisco.com/ns/yang/Cisco-IOS-XE-switch"
 def _native(interfaces="", extra=""):
     return ('<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
             f'<native xmlns="{_NATIVE}"><interface>{interfaces}</interface>{extra}</native></data>')
+
+
+_ETH = "http://cisco.com/ns/yang/Cisco-IOS-XE-ethernet"
+_AAA = "http://cisco.com/ns/yang/Cisco-IOS-XE-aaa"
 
 
 def _port(kind, num, switchport="", extra=""):
@@ -1470,7 +1492,7 @@ class ExistingConfigCheckTests(unittest.TestCase):
         self.assertTrue(result["found"])
 
     def test_channel_group_found(self):
-        cg = ('<channel-group xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-ethernet">'
+        cg = (f'<channel-group xmlns="{_ETH}">'
               "<number>5</number><mode>active</mode></channel-group>")
         result, _ = self._check(_native(_port("TenGigabitEthernet", "1/1/3", extra=cg)))
         self.assertTrue(result["found"])
@@ -1521,7 +1543,7 @@ class ExistingConfigCheckTests(unittest.TestCase):
 
     def test_tacacs_server_found_count_only(self):
         servers = "".join(f"<server><name>tac{i}</name></server>" for i in range(3))
-        result, _ = self._check(_native(extra=f"<tacacs>{servers}</tacacs>"))
+        result, _ = self._check(_native(extra=f'<tacacs xmlns="{_AAA}">{servers}</tacacs>'))
         self.assertTrue(result["found"])
         self.assertEqual(result["findings"], ["TACACS servers: 3"])
         self.assertNotIn("tac0", json.dumps(result))
@@ -1533,7 +1555,7 @@ class ExistingConfigCheckTests(unittest.TestCase):
                f'<group xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-aaa"><server><tacacs-plus><name>g</name>'
                f'<key>{FAKE_KEY}</key></tacacs-plus></server></group></aaa>')
         port = _port("GigabitEthernet", "1/0/6", _access(30), extra=f"<description>{FAKE_KEY}</description>")
-        result, _ = self._check(_native(port, f"<tacacs>{servers}</tacacs>{aaa}"))
+        result, _ = self._check(_native(port, f'<tacacs xmlns="{_AAA}">{servers}</tacacs>{aaa}'))
         self.assertTrue(result["found"])
         out = json.dumps(result)
         self.assertNotIn(FAKE_KEY, out)
@@ -1567,6 +1589,16 @@ class ExistingConfigCheckTests(unittest.TestCase):
         result, _ = self._check("not xml")
         self.assertFalse(result["success"])
         self.assertNotIn("found", result)
+
+    def test_filter_namespaces(self):
+        root = etree.fromstring(main._EXISTING_CONFIG_FILTER)
+        ns = lambda name: {etree.QName(e).namespace for e in root.iter() if etree.QName(e).localname == name}
+        native = {_NATIVE}
+        self.assertEqual(ns("channel-group"), {_ETH})
+        self.assertEqual(ns("tacacs"), {_AAA})
+        for name in ("native", "interface", "aaa", "switchport-config", "vrf", "Port-channel", "GigabitEthernet"):
+            self.assertTrue(ns(name) <= native | {None} and ns(name), name)
+        self.assertEqual(ns("server"), {_AAA})
 
     def test_registered_in_dispatch(self):
         self.assertIs(main._DISPATCH["netconf-existing-config-check"], main.existing_config_check)

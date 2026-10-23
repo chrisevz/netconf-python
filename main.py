@@ -1306,13 +1306,18 @@ def _backup_config(conn, device_name, filesystem) -> dict:
             xml_str = reply.xml if hasattr(reply, "xml") else str(reply)
             tree = _etree.fromstring(xml_str.encode() if isinstance(xml_str, str) else xml_str)
             result_nodes = tree.xpath(".//*[local-name()='result']")
+            result_text = result_nodes[0].text.strip() if result_nodes and result_nodes[0].text else None
+            # a copy that answers without an rpc-error but says error/fail in its result text is not a backup
+            if result_text and re.search(r"error|fail", result_text, re.I):
+                return {"success": False, "host": conn["host"], "device_name": device_name,
+                        "error": result_text, "error_type": "BackupFailed", "destination": destination}
             return {
                 "success": True,
                 "host": conn["host"],
                 "device_name": device_name,
                 "method": "Cisco-IOS-XE-rpc:copy",
                 "destination": destination,
-                "result": result_nodes[0].text.strip() if result_nodes and result_nodes[0].text else None,
+                "result": result_text,
             }
     except RPCError as e:
         return dict(_rpc_failure(conn, device_name, e), destination=destination)
@@ -1376,14 +1381,19 @@ _CHECK_PHYSICAL_TYPES = ("GigabitEthernet", "TwoGigabitEthernet", "FiveGigabitEt
                          "TenGigabitEthernet", "TwentyFiveGigE", "FortyGigabitEthernet", "HundredGigE",
                          "AppGigabitEthernet")
 
+# Not every node is in the native namespace: channel-group is in Cisco-IOS-XE-ethernet and the tacacs server list in
+# Cisco-IOS-XE-aaa (the plain native `tacacs`-like node under `ip` is the source-interface setting, a different node).
+_CHECK_CHANNEL_GROUP = '<channel-group xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-ethernet"/>'
+_CHECK_TACACS = '<tacacs xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-aaa"><server><name/></server></tacacs>'
+
 _EXISTING_CONFIG_FILTER = (
     '<native xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-native">'
     "<interface>"
-    + "".join(f"<{t}><name/><switchport-config/><channel-group/><vrf/></{t}>" for t in _CHECK_PHYSICAL_TYPES)
+    + "".join(f"<{t}><name/><switchport-config/>{_CHECK_CHANNEL_GROUP}<vrf/></{t}>" for t in _CHECK_PHYSICAL_TYPES)
     + "<Port-channel><name/></Port-channel>"
     "</interface>"
     "<aaa/>"
-    "<tacacs><server><name/></server></tacacs>"
+    + _CHECK_TACACS +
     "</native>"
 )
 
