@@ -1496,17 +1496,10 @@ def existing_config_check(conn, args) -> dict:
     except Exception as e:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "error": str(e), "error_type": type(e).__name__}
-    # AAA and TACACS first, so the cap never hides them; then Port-channels, then ports, each in natural order
-    aaa, tacacs, interfaces = [], [], []
+    findings = []
     for native in tree.iter():
         if _ln(native) == "native":
-            aaa += _aaa_findings(native)
-            tacacs += _tacacs_findings(native)
-            interfaces += _interface_findings(native)
-    natural = lambda line: [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", line.split(":")[0])]
-    channels = sorted((f for f in interfaces if f.startswith("Port-channel")), key=natural)
-    ports = sorted((f for f in interfaces if not f.startswith("Port-channel")), key=natural)
-    findings = aaa + tacacs + channels + ports
+            findings += _interface_findings(native) + _aaa_findings(native) + _tacacs_findings(native)
     return {"success": True, "host": conn["host"], "device_name": device_name,
             "found": bool(findings), "findings": findings[:_FINDINGS_MAX],
             "findings_total": len(findings)}

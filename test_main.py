@@ -1568,24 +1568,6 @@ class ExistingConfigCheckTests(unittest.TestCase):
         self.assertEqual(len(result["findings"]), 20)
         self.assertEqual(result["findings_total"], 30)
 
-    def test_cap_keeps_aaa_and_tacacs_first(self):
-        ports = "".join(_port("GigabitEthernet", f"1/0/{i}", _access(30)) for i in range(1, 26))
-        extra = ('<aaa><new-model xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-aaa"/></aaa>'
-                 f'<tacacs xmlns="{_AAA}"><server><name>t1</name></server></tacacs>')
-        result, _ = self._check(_native(_port("Port-channel", "5") + ports, extra))
-        self.assertEqual(result["findings_total"], 28)
-        self.assertEqual(len(result["findings"]), 20)
-        self.assertEqual(result["findings"][:3], ["AAA: aaa new-model", "TACACS servers: 1", "Port-channel5"])
-        self.assertTrue(result["found"])
-
-    def test_natural_order(self):
-        ports = "".join(_port("FortyGigabitEthernet", n, _access(30)) for n in ("1/0/10", "1/0/2", "1/0/1"))
-        pcs = _port("Port-channel", "10") + _port("Port-channel", "5")
-        result, _ = self._check(_native(ports + pcs))
-        names = [f.split(":")[0] for f in result["findings"]]
-        self.assertEqual(names, ["Port-channel5", "Port-channel10", "FortyGigabitEthernet1/0/1",
-                                 "FortyGigabitEthernet1/0/2", "FortyGigabitEthernet1/0/10"])
-
     def test_nxos_not_supported(self):
         result, m = self._check(_native(), [NXOS_CAP])
         self.assertFalse(result["success"])
