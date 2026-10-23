@@ -1542,20 +1542,20 @@ class ExistingConfigCheckTests(unittest.TestCase):
         self.assertFalse(result["found"])
 
     def test_tacacs_server_found_count_only(self):
-        servers = "".join(f'<server xmlns="{_AAA}"><name>tac{i}</name></server>' for i in range(3))
-        result, _ = self._check(_native(extra=f'<tacacs>{servers}</tacacs>'))
+        servers = "".join(f"<server><name>tac{i}</name></server>" for i in range(3))
+        result, _ = self._check(_native(extra=f'<tacacs xmlns="{_AAA}">{servers}</tacacs>'))
         self.assertTrue(result["found"])
         self.assertEqual(result["findings"], ["TACACS servers: 3"])
         self.assertNotIn("tac0", json.dumps(result))
 
     def test_output_never_contains_key_text(self):
-        servers = (f'<server xmlns="{_AAA}"><name>tac1</name><address><ipv4>192.0.2.10</ipv4></address>'
+        servers = (f"<server><name>tac1</name><address><ipv4>192.0.2.10</ipv4></address>"
                    f"<key><key>{FAKE_KEY}</key><key-type>7</key-type></key></server>")
         aaa = (f'<aaa><new-model xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-aaa"/>'
                f'<group xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-aaa"><server><tacacs-plus><name>g</name>'
                f'<key>{FAKE_KEY}</key></tacacs-plus></server></group></aaa>')
         port = _port("GigabitEthernet", "1/0/6", _access(30), extra=f"<description>{FAKE_KEY}</description>")
-        result, _ = self._check(_native(port, f'<tacacs>{servers}</tacacs>{aaa}'))
+        result, _ = self._check(_native(port, f'<tacacs xmlns="{_AAA}">{servers}</tacacs>{aaa}'))
         self.assertTrue(result["found"])
         out = json.dumps(result)
         self.assertNotIn(FAKE_KEY, out)
@@ -1571,7 +1571,7 @@ class ExistingConfigCheckTests(unittest.TestCase):
     def test_cap_keeps_aaa_and_tacacs_first(self):
         ports = "".join(_port("GigabitEthernet", f"1/0/{i}", _access(30)) for i in range(1, 26))
         extra = ('<aaa><new-model xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-aaa"/></aaa>'
-                 f'<tacacs><server xmlns="{_AAA}"><name>t1</name></server></tacacs>')
+                 f'<tacacs xmlns="{_AAA}"><server><name>t1</name></server></tacacs>')
         result, _ = self._check(_native(_port("Port-channel", "5") + ports, extra))
         self.assertEqual(result["findings_total"], 28)
         self.assertEqual(len(result["findings"]), 20)
@@ -1613,7 +1613,7 @@ class ExistingConfigCheckTests(unittest.TestCase):
         ns = lambda name: {etree.QName(e).namespace for e in root.iter() if etree.QName(e).localname == name}
         native = {_NATIVE}
         self.assertEqual(ns("channel-group"), {_ETH})
-        self.assertEqual(ns("tacacs"), {_NATIVE})
+        self.assertEqual(ns("tacacs"), {_AAA})
         for name in ("native", "interface", "aaa", "switchport-config", "vrf", "Port-channel", "GigabitEthernet"):
             self.assertTrue(ns(name) <= native | {None} and ns(name), name)
         self.assertEqual(ns("server"), {_AAA})
