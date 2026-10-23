@@ -315,14 +315,16 @@ class PreviewConfigFlowTests(unittest.TestCase):
     """preview_config end to end with a mocked manager: ordering and result shape."""
 
     def _run(self, diff=True, render_supported=True, reads=None, lock=None, force_discard=False,
-             edit_error=None, version="17.15.4", validate_error=None, candidate_render="hostname a\ndescription new\n"):
+             edit_error=None, version="17.15.4", validate_error=None, candidate_render="hostname a\ndescription new\n",
+             caps=None):
         """version: what the mocked version read returns (an Exception instance makes the read fail); the
         default is on the allow-listed train, so the fast flow runs. reads: values for the mocked
         _get_config_xml; the default answers by source (running "<a>1</a>"; candidate "<a>1</a>" before the
         edit and "<a>2</a>" after it). lock: side_effect for _acquire_candidate_lock."""
         m = MagicMock()
-        m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0", IOSXE_CAP,
-                                 "urn:ietf:params:netconf:capability:validate:1.1"]
+        m.server_capabilities = caps if caps is not None else [
+            "urn:ietf:params:netconf:capability:candidate:1.0", IOSXE_CAP,
+            "urn:ietf:params:netconf:capability:validate:1.1"]
         if edit_error is not None:
             m.edit_config.side_effect = edit_error
         if validate_error is not None:
@@ -519,11 +521,20 @@ class FastPreviewGateTests(unittest.TestCase):
             with patch.object(main, "_read_version", return_value=version):
                 self.assertEqual(main._fast_preview_allowed(m, "iosxe"), expected, version)
 
-    def test_gate_is_false_for_other_platforms_without_reading_the_version(self):
-        for platform in ("nxos", "unknown"):
+    def test_gate_is_false_for_nxos_without_reading_the_version(self):
+        for platform in ("nxos", "other"):
             with patch.object(main, "_read_version") as read:
                 self.assertFalse(main._fast_preview_allowed(MagicMock(), platform))
             read.assert_not_called()
+
+    def test_gate_for_unknown_platform_uses_the_iosxe_version_read(self):
+        m = MagicMock()
+        for version, expected in (("17.15.5", True), ("17.12.4", False), ("", False)):
+            with patch.object(main, "_read_version", return_value=version) as read:
+                self.assertEqual(main._fast_preview_allowed(m, "unknown"), expected, version)
+            read.assert_called_once_with(m, "iosxe")
+        with patch.object(main, "_read_version", side_effect=RuntimeError("unknown-namespace")):
+            self.assertFalse(main._fast_preview_allowed(m, "unknown"))
 
     def test_gate_is_false_when_the_version_read_fails(self):
         with patch.object(main, "_read_version", side_effect=RuntimeError("boom")):
@@ -569,14 +580,42 @@ class FastPreviewGateTests(unittest.TestCase):
         result, order, _ = PreviewConfigFlowTests()._run(version="")
         self.assertEqual(self._names(order), ["start", "read", "read", "lock"])
 
-    def test_unknown_platform_runs_todays_flow_without_a_version_read(self):
-        # no IOS XE / NX-OS module in the hello: platform "unknown", so no fast path even on "17.15"
+    # The lab C9500 stack (IOS XE 17.15) lists no YANG module in its hello, only yang-library: platform
+    # "unknown" (seen live 10-23 via netconf-is-alive: platform unknown, output 17.15).
+    HELLO_WITHOUT_MODULES = ["urn:ietf:params:netconf:base:1.1", "urn:ietf:params:netconf:capability:candidate:1.0",
+                             "urn:ietf:params:netconf:capability:validate:1.1",
+                             "urn:ietf:params:netconf:capability:confirmed-commit:1.1",
+                             "urn:ietf:params:netconf:capability:yang-library:1.1?revision=2019-01-04&content-id=x"]
+
+    def test_hello_without_modules_on_17_15_takes_the_fast_path(self):
         m = MagicMock()
-        m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0"]
+        m.server_capabilities = self.HELLO_WITHOUT_MODULES
         self.assertEqual(main._detect_platform(m), "unknown")
-        with patch.object(main, "_read_version", return_value="17.15.4") as read:
-            self.assertFalse(main._fast_preview_allowed(m, main._detect_platform(m)))
-        read.assert_not_called()
+        result, order, _ = PreviewConfigFlowTests()._run(version="17.15.5", caps=self.HELLO_WITHOUT_MODULES)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self._names(order), ["start", "lock"])
+        self.assertEqual(result["dirty_check"], "lock-first")
+        self.assertEqual(result["fingerprint"], "cli")
+        self.assertIn("version_read", result["timings"]["steps"])
+
+    def test_hello_without_modules_and_a_failed_version_read_runs_todays_flow(self):
+        result, order, _ = PreviewConfigFlowTests()._run(version=RuntimeError("unknown-namespace"),
+                                                         caps=self.HELLO_WITHOUT_MODULES)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(self._names(order), ["start", "read", "read", "lock"])
+        self.assertEqual(result["dirty_check"], "full-read")
+        self.assertEqual(result["fingerprint"], "xml")
+
+    def test_hello_without_modules_on_another_train_runs_todays_flow(self):
+        result, order, _ = PreviewConfigFlowTests()._run(version="17.12.4", caps=self.HELLO_WITHOUT_MODULES)
+        self.assertEqual(self._names(order), ["start", "read", "read", "lock"])
+        self.assertEqual(result["dirty_check"], "full-read")
+
+    def test_hello_without_modules_fast_and_todays_flow_agree_for_the_operator(self):
+        fast, _, _ = PreviewConfigFlowTests()._run(version="17.15.5", caps=self.HELLO_WITHOUT_MODULES)
+        slow, _, _ = PreviewConfigFlowTests()._run(version="17.12.4", caps=self.HELLO_WITHOUT_MODULES)
+        for key in FastVersusTodaysFlowEquivalenceTests.SAME:
+            self.assertEqual(fast.get(key), slow.get(key), key)
 
     def test_nxos_never_reads_the_version_and_runs_todays_flow(self):
         order = NxosPreviewOrderTests()

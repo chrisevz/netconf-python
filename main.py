@@ -272,9 +272,11 @@ FAST_PREVIEW_IOSXE_TRAINS = ("17.15",)
 
 def _fast_preview_allowed(m, platform: str) -> bool:
     """True only for IOS XE on a train in FAST_PREVIEW_IOSXE_TRAINS, from the same small version read
-    is-alive uses. A failed or unparsable read, another platform or another train is False: the preview
-    then runs the original flow (dirty check first with full XML reads, plain XML hash)."""
-    if platform != "iosxe":
+    is-alive uses. An "unknown" platform gets the IOS XE read too (like is-alive's fallback): an IOS XE
+    switch may list its YANG modules only through yang-library and not in the hello (the lab C9500 stack on
+    17.15 does), so the version read decides. A failed or unparsable read, NX-OS or another train is
+    False: the preview then runs the original flow (dirty check first with full XML reads, plain XML hash)."""
+    if platform not in ("iosxe", "unknown"):
         return False
     try:
         version = _read_version(m, "iosxe")
@@ -698,8 +700,8 @@ def preview_config(conn, args) -> dict:
     leave zero state on the device — all in one session.
 
     The sequence below is the "lock-first" flow. It runs only on IOS XE on a train in
-    FAST_PREVIEW_IOSXE_TRAINS (see _fast_preview_allowed); NX-OS, an undetected platform,
-    another train or a failed version read run the original flow (dirty check first with
+    FAST_PREVIEW_IOSXE_TRAINS (see _fast_preview_allowed; an undetected platform counts when the IOS XE
+    version read answers); NX-OS, another train or a failed version read run the original flow (dirty check first with
     full XML reads, plain XML hash, described last). Results carry dirty_check
     ("lock-first" | "full-read") and fingerprint ("cli" | "xml").
 
@@ -781,7 +783,7 @@ def preview_config(conn, args) -> dict:
             # Only on a proven train (see FAST_PREVIEW_IOSXE_TRAINS); any other train, a failed version read
             # or NX-OS runs the original order below.
             lock_first = cli_render and _fast_preview_allowed(m, platform)
-            if platform == "iosxe":
+            if platform in ("iosxe", "unknown"):
                 steps.lap("version_read")
             path = "lock-first" if lock_first else "full-read"
             running_xml = None
