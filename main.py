@@ -1381,10 +1381,11 @@ _CHECK_PHYSICAL_TYPES = ("GigabitEthernet", "TwoGigabitEthernet", "FiveGigabitEt
                          "TenGigabitEthernet", "TwentyFiveGigE", "FortyGigabitEthernet", "HundredGigE",
                          "AppGigabitEthernet")
 
-# Not every node is in the native namespace: channel-group is in Cisco-IOS-XE-ethernet and the tacacs server list in
-# Cisco-IOS-XE-aaa (the plain native `tacacs`-like node under `ip` is the source-interface setting, a different node).
+# Not every node is in the native namespace: channel-group is in Cisco-IOS-XE-ethernet; the tacacs container is native
+# but its `server` list is in Cisco-IOS-XE-aaa (the aaa-namespace `tacacs` under `ip` is the source-interface setting,
+# a different node). A filter element in the wrong namespace silently matches nothing.
 _CHECK_CHANNEL_GROUP = '<channel-group xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-ethernet"/>'
-_CHECK_TACACS = '<tacacs xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-aaa"><server><name/></server></tacacs>'
+_CHECK_TACACS = '<tacacs><server xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-aaa"><name/></server></tacacs>'
 
 _EXISTING_CONFIG_FILTER = (
     '<native xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-native">'
