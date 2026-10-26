@@ -293,7 +293,7 @@ class ParallelRenderTests(unittest.TestCase):
         m2.dispatch.return_value = PreviewRenderTests._fake_reply("running text\n")
         session = MagicMock()
         session.__enter__.return_value = m2
-        conn = {"host": "192.0.2.1"}
+        conn = {"host": "10.0.0.1"}
         with patch.object(main, "_session", return_value=session) as opened:
             thread, box = main._start_background_render(conn, "running")
             thread.join(5)
@@ -305,7 +305,7 @@ class ParallelRenderTests(unittest.TestCase):
 
     def test_background_render_reports_a_failed_session_instead_of_raising(self):
         with patch.object(main, "_session", side_effect=RuntimeError("no session")):
-            thread, box = main._start_background_render({"host": "192.0.2.1"}, "running")
+            thread, box = main._start_background_render({"host": "10.0.0.1"}, "running")
             thread.join(5)
         self.assertIsInstance(box["exc"], RuntimeError)
         self.assertIsNone(box["result"])
@@ -352,7 +352,7 @@ class PreviewConfigFlowTests(unittest.TestCase):
                     return "<a>1</a>"
                 return "<a>2</a>" if m.edit_config.called else "<a>1</a>"
             order.read.side_effect = read
-        conn = {"host": "192.0.2.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+        conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
         args = MagicMock(config_xml="<config/>", force_discard=force_discard, diff=diff)
         version_read = MagicMock(side_effect=version if isinstance(version, Exception) else None,
                                  return_value=version)
@@ -369,7 +369,7 @@ class PreviewConfigFlowTests(unittest.TestCase):
         self.assertTrue(result["success"])
         names = [c[0] for c in order.mock_calls if c[0] in ("start", "lock")]
         self.assertEqual(names, ["start", "lock"])
-        order.start.assert_called_once_with({"host": "192.0.2.1", "lock_timeout": 1, "lock_poll_interval": 0.1},
+        order.start.assert_called_once_with({"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1},
                                             "running")
 
     def test_lock_ok_skips_both_pre_edit_xml_reads(self):
@@ -580,8 +580,8 @@ class FastPreviewGateTests(unittest.TestCase):
         result, order, _ = PreviewConfigFlowTests()._run(version="")
         self.assertEqual(self._names(order), ["start", "read", "read", "lock"])
 
-    # A Catalyst 9500 stack (IOS XE 17.15) lists no YANG module in its hello, only yang-library: platform
-    # "unknown" (seen live via netconf-is-alive: platform unknown, output 17.15).
+    # The lab C9500 stack (IOS XE 17.15) lists no YANG module in its hello, only yang-library: platform
+    # "unknown" (seen live 10-23 via netconf-is-alive: platform unknown, output 17.15).
     HELLO_WITHOUT_MODULES = ["urn:ietf:params:netconf:base:1.1", "urn:ietf:params:netconf:capability:candidate:1.0",
                              "urn:ietf:params:netconf:capability:validate:1.1",
                              "urn:ietf:params:netconf:capability:confirmed-commit:1.1",
@@ -712,7 +712,7 @@ class NxosPreviewFlowTests(unittest.TestCase):
         m.dispatch.side_effect = _make_rpc_error("operation-not-supported")
         session = MagicMock()
         session.__enter__.return_value = m
-        conn = {"host": "192.0.2.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+        conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
         args = MagicMock(config_xml="<config/>", force_discard=False, diff=True)
         with patch.object(main, "_session", return_value=session), \
              patch.object(main, "_start_background_render") as background, \
@@ -743,7 +743,7 @@ class NxosPreviewOrderTests(unittest.TestCase):
             order.lock.return_value = lock
         session = MagicMock()
         session.__enter__.return_value = m
-        conn = {"host": "192.0.2.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+        conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
         args = MagicMock(config_xml="<config/>", force_discard=force_discard, diff=True)
         with patch.object(main, "_session", return_value=session), \
              patch.object(main, "_start_background_render") as background, \
@@ -793,7 +793,7 @@ class NxosPreviewOrderTests(unittest.TestCase):
 
 
 class PushDriftGuardTests(unittest.TestCase):
-    """send_config_xml's expect_running_hash guard and lock labelling, mocked manager."""
+    """send_command's expect_running_hash guard and lock labelling, mocked manager."""
 
     RENDER = "hostname a\ndescription old\n"
 
@@ -810,13 +810,13 @@ class PushDriftGuardTests(unittest.TestCase):
             order.lock.return_value = lock
         session = MagicMock()
         session.__enter__.return_value = m
-        conn = {"host": "192.0.2.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+        conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
         args = MagicMock(config_xml="<config/>", expect_running_hash=expect, confirm_timeout=None)
         with patch.object(main, "_session", return_value=session), \
              patch.object(main, "_get_modelled_config_clis", order.render), \
              patch.object(main, "_get_config_xml", order.read), \
              patch.object(main, "_acquire_candidate_lock", order.lock):
-            return main.send_config_xml(conn, args), order, m
+            return main.send_command(conn, args), order, m
 
     def test_drift_check_label(self):
         self.assertEqual(self._run(main._cli_hash(self.RENDER))[0]["drift_check"], "cli")
@@ -910,7 +910,7 @@ class PushDriftGuardTests(unittest.TestCase):
 
 
 class SendConfigXmlTests(unittest.TestCase):
-    """send_config_xml's push path, with a mocked ncclient manager."""
+    """send_command's push path, with a mocked ncclient manager."""
 
     CANDIDATE = "urn:ietf:params:netconf:capability:candidate:1.0"
     VALIDATE = "urn:ietf:params:netconf:capability:validate:1.1"
@@ -926,11 +926,11 @@ class SendConfigXmlTests(unittest.TestCase):
             m.commit.side_effect = commit_error
         session = MagicMock()
         session.__enter__.return_value = m
-        conn = {"host": "192.0.2.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+        conn = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
         args = MagicMock(config_xml="<config/>", expect_running_hash=None, confirm_timeout=confirm_timeout)
         with patch.object(main, "_session", return_value=session), \
              patch.object(main, "_acquire_candidate_lock", return_value=0.0):
-            return main.send_config_xml(conn, args), m
+            return main.send_command(conn, args), m
 
     def test_refuses_without_candidate_and_never_edits_running(self):
         result, m = self._run([])
@@ -1015,7 +1015,7 @@ class UnresolvedSecretPlaceholderTests(unittest.TestCase):
     password or key on the device."""
 
     XML = "<config><key>$GATEWAYSECRET_(example-name)</key><other>keep-out-of-errors</other></config>"
-    CONN = {"host": "192.0.2.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
+    CONN = {"host": "10.0.0.1", "lock_timeout": 1, "lock_poll_interval": 0.1}
 
     def test_preview_refuses_before_opening_a_session(self):
         args = MagicMock(config_xml=self.XML, force_discard=False, diff=True)
@@ -1029,7 +1029,7 @@ class UnresolvedSecretPlaceholderTests(unittest.TestCase):
     def test_push_refuses_before_opening_a_session(self):
         args = MagicMock(config_xml=self.XML, expect_running_hash=None, confirm_timeout=600)
         with patch.object(main, "_session") as session:
-            result = main.send_config_xml(self.CONN, args)
+            result = main.send_command(self.CONN, args)
         session.assert_not_called()
         self.assertFalse(result["success"])
         self.assertEqual(result["error_type"], "UnresolvedSecretPlaceholder")
@@ -1060,7 +1060,7 @@ class ConfirmAndCancelCommitTests(unittest.TestCase):
         session.__enter__.return_value = m
         args = MagicMock(persist_id=persist_id)
         with patch.object(main, "_session", return_value=session):
-            return op({"host": "192.0.2.1"}, args), m
+            return op({"host": "10.0.0.1"}, args), m
 
     def test_confirm_sends_confirming_commit_with_persist_id(self):
         result, m = self._run(main.confirm_commit, [self.CONFIRMED_1_1])
@@ -1118,7 +1118,7 @@ class IsAliveCapabilityTests(unittest.TestCase):
         session = MagicMock()
         session.__enter__.return_value = m
         with patch.object(main, "_session", return_value=session):
-            return main.is_alive({"host": "192.0.2.1"}, MagicMock())
+            return main.is_alive({"host": "10.0.0.1"}, MagicMock())
 
     def test_reports_persistent_confirmed_commit_when_advertised(self):
         result = self._run(["urn:ietf:params:netconf:capability:confirmed-commit:1.1"])
@@ -1147,7 +1147,7 @@ class IsAlivePlatformTests(unittest.TestCase):
         session = MagicMock()
         session.__enter__.return_value = m
         with patch.object(main, "_session", return_value=session):
-            return main.is_alive({"host": "192.0.2.1"}, MagicMock()), m
+            return main.is_alive({"host": "10.0.0.1"}, MagicMock()), m
 
     def test_nxos_reads_version_from_showversion(self):
         result, m = self._run([NXOS_CAP], self.NXOS_REPLY)
@@ -1211,23 +1211,9 @@ class IsAlivePlatformTests(unittest.TestCase):
         self.assertFalse(result["capabilities"]["confirmed_commit_1_0"])
 
 
-class OpNameTests(unittest.TestCase):
-    def test_old_and_new_op_names_reach_the_same_function(self):
-        self.assertIs(main._DISPATCH["netconf-send-config-xml"], main.send_config_xml)
-        self.assertIs(main._DISPATCH["netconf-send-command"], main.send_config_xml)
-
-    def test_removed_ops_are_gone(self):
-        for op in ("netconf-get-config-clis", "netconf-discard"):
-            self.assertNotIn(op, main._DISPATCH)
-
-    def test_save_config_has_no_backup_flag(self):
-        with self.assertRaises(SystemExit):
-            main.build_parser().parse_args(["--op", "netconf-save-config", "--backup_filesystem", "flash"])
-
-
 class NormalizeArgsTests(unittest.TestCase):
     def _parse(self, *argv):
-        args = main.build_parser().parse_args(["--op", "netconf-send-config-xml", *argv])
+        args = main.build_parser().parse_args(["--op", "netconf-send-command", *argv])
         main._normalize_args(args)
         return args
 
@@ -1257,7 +1243,7 @@ class SaveConfigTests(unittest.TestCase):
         session = MagicMock()
         session.__enter__.return_value = m
         with patch.object(main, "_session", return_value=session):
-            return main.save_config({"host": "192.0.2.1"}, MagicMock()), m
+            return main.save_config({"host": "10.0.0.1"}, MagicMock()), m
 
     @staticmethod
     def _reply(text):
@@ -1308,6 +1294,100 @@ class SaveConfigTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["error_type"], "SaveUnsupported")
         self.assertEqual(m.dispatch.call_count, 1)
+
+
+class SaveConfigBackupTests(unittest.TestCase):
+    """backup_filesystem: copy running to <fs>:backup-<UTC stamp>, startup untouched."""
+
+    def _run(self, backup_filesystem, dispatch_side_effect=None, capabilities=None):
+        m = MagicMock()
+        m.server_capabilities = capabilities if capabilities is not None else [IOSXE_CAP]
+        reply = MagicMock()
+        reply.xml = ('<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+                     '<result xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-rpc">[OK]</result></rpc-reply>')
+        m.dispatch.side_effect = dispatch_side_effect if dispatch_side_effect is not None else [reply]
+        session = MagicMock()
+        session.__enter__.return_value = m
+        args = MagicMock()
+        args.backup_filesystem = backup_filesystem
+        with patch.object(main, "_session", return_value=session) as sess:
+            return main.save_config({"host": "192.0.2.1"}, args), m, sess
+
+    def test_flash_backup_destination_format_and_rpc(self):
+        result, m, _ = self._run("flash")
+        self.assertTrue(result["success"])
+        self.assertRegex(result["destination"], r"^flash:backup-\d{8}-\d{6}$")
+        self.assertEqual(m.dispatch.call_count, 1)
+        sent = m.dispatch.call_args.args[0]
+        self.assertEqual(sent.tag, "{http://cisco.com/ns/yang/Cisco-IOS-XE-rpc}copy")
+        self.assertEqual(sent[0].text, "running-config")
+        self.assertEqual(sent[1].text, result["destination"])
+
+    def test_bootflash_backup_destination(self):
+        result, _, _ = self._run("bootflash")
+        self.assertRegex(result["destination"], r"^bootflash:backup-\d{8}-\d{6}$")
+
+    def test_timestamp_is_utc(self):
+        with patch.object(main, "datetime") as dt:
+            dt.now.return_value = datetime(2026, 10, 23, 9, 5, 7, tzinfo=timezone.utc)
+            result, _, _ = self._run("flash")
+        self.assertEqual(result["destination"], "flash:backup-20261023-090507")
+        dt.now.assert_called_with(timezone.utc)
+
+    def test_other_value_refused_before_a_session_opens(self):
+        for bad in ("usbflash0", "FLASH", "flash:", "nvram"):
+            result, m, sess = self._run(bad)
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error_type"], "InvalidBackupFilesystem")
+            sess.assert_not_called()
+
+    def test_empty_or_unset_is_the_normal_save(self):
+        for unset in ("", None):
+            ok = MagicMock()
+            ok.xml = ('<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+                      '<result xmlns="http://cisco.com/yang/cisco-ia">saved</result></rpc-reply>')
+            result, m, _ = self._run(unset, [ok])
+            self.assertEqual(result["method"], "cisco-ia:save-config")
+            self.assertNotIn("destination", result)
+            self.assertIn("cisco-ia", m.dispatch.call_args.args[0].tag)
+
+    def _backup_with_result(self, text):
+        r = MagicMock()
+        r.xml = ('<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">'
+                 f'<result xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-rpc">{text}</result></rpc-reply>')
+        return self._run("flash", [r])[0]
+
+    def test_backup_result_text_with_error_or_fail_is_a_failure(self):
+        for text in ("%Error opening flash:backup (No space left on device)", "Copy FAILED", "copy failure"):
+            result = self._backup_with_result(text)
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error_type"], "BackupFailed")
+            self.assertEqual(result["error"], text)
+            self.assertRegex(result["destination"], r"^flash:backup-")
+
+    def test_backup_result_ok_text_is_a_success(self):
+        for text in ("[OK]", "Copy in progress...", ""):
+            self.assertTrue(self._backup_with_result(text)["success"])
+
+    def test_nxos_backup_not_supported(self):
+        result, m, _ = self._run("flash", capabilities=[NXOS_CAP])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "NotSupported")
+        m.dispatch.assert_not_called()
+
+    def test_copy_failure_is_reported_without_fallback(self):
+        result, m, _ = self._run("flash", [_make_rpc_error("operation-failed")])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "RPCError")
+        self.assertEqual(m.dispatch.call_count, 1)
+
+    def test_parser_accepts_backup_filesystem(self):
+        args = main.build_parser().parse_args(["--op", "netconf-save-config", "--backup_filesystem", "flash"])
+        main._normalize_args(args)
+        self.assertEqual(args.backup_filesystem, "flash")
+        args = main.build_parser().parse_args(["--op", "netconf-save-config", "--backup_filesystem", ""])
+        main._normalize_args(args)
+        self.assertIsNone(args.backup_filesystem)
 
 
 # Synthetic fixtures only: documentation addresses, invented names, a planted fake key.
@@ -1544,7 +1624,7 @@ class ExistingConfigCheckTests(unittest.TestCase):
 
 class FormatForHumansTests(unittest.TestCase):
     def test_is_alive_returns_full_json_including_version(self):
-        result = {"success": True, "alive": True, "host": "192.0.2.1", "output": "17.15"}
+        result = {"success": True, "alive": True, "host": "10.0.0.1", "output": "17.15"}
         self.assertEqual(json.loads(main._format_for_humans(result, "netconf-is-alive")), result)
 
 
