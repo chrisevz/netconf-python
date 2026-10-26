@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Cisco IOS XE NETCONF service for IAG5 — single use case.
+"""NETCONF service for IAG5 — Cisco IOS XE and NX-OS.
 
-Pushes a pre-built NETCONF <config> XML payload to a Cisco IOS XE device,
-rendered as CLI text (or, where unavailable, a structural XML diff) for
-human approval before it is committed.
+Pushes a pre-built NETCONF <config> XML payload to a device, after showing
+the change as CLI text (IOS XE) or a structural XML diff for human approval.
 
-Fleet: Catalyst access (IE 3400, IE 3500, CAT 9300/9400) and Catalyst core
-(CAT 9500), all IOS XE, all DMI netconf-yang on port 830. Trains: 17.15.5 (N)
-and 17.12.4 (N-1). NX-OS is out of scope for this driver — see the
-netconf-python git history for the removed dual-platform version if that
-work resumes later.
+Transport is NETCONF over SSH, port 830 (IOS XE: DMI netconf-yang).
+Verified: IOS XE 17.15.5 on a Catalyst 9500 stack (device-rendered preview,
+confirmed commit); NX-OS 10.5(5) on a Nexus 9000v (is-alive, candidate
+get-config, xml-diff preview, confirmed commit and cancel from a new session).
 
-Actions: netconf-is-alive, netconf-get-config, netconf-get-config-clis,
-netconf-preview-config, netconf-send-command, netconf-discard,
-netconf-save-config, netconf-confirm-commit, netconf-cancel-commit,
-netconf-existing-config-check.
+Actions: netconf-is-alive, netconf-get-config, netconf-preview-config,
+netconf-send-config-xml, netconf-save-config, netconf-confirm-commit,
+netconf-cancel-commit, netconf-existing-config-check (IOS XE only; NX-OS
+returns error_type=NotSupported).
 
 netconf-preview-config is the core feature: it stages a proposed config_xml
 change into the candidate datastore, renders/diffs it against running, and
@@ -23,19 +21,18 @@ reports which rendering mode produced the diff via preview_mode:
   - "device-rendered" — CLI diff via get-modelled-config-clis
     (Cisco-IOS-XE-cli-rpc), available on 17.15.5-class images.
   - "xml-diff" — structural XML diff via plain get-config, used when
-    get-modelled-config-clis is unsupported (expected on 17.12.4 — that
-    train most likely carries the Cisco-IOS-XE-cli-rpc 2022-07-01 revision,
-    which predates get-modelled-config-clis).
+    get-modelled-config-clis is unsupported (NX-OS, or an IOS XE image
+    without the RPC).
 preview_mode is always present in the result — an operator approving a
 change needs to know whether they're looking at the device's own rendering
 or a structural diff, never a guess.
 
-netconf-send-command pushes the same config_xml for real: lock candidate,
+netconf-send-config-xml pushes the same config_xml for real: lock candidate,
 discard any stray staged content, edit, commit. Refuses to touch running
 config with expect_running_hash set if running has drifted since a prior
 netconf-preview-config call captured its hash.
 
-netconf-send-command with confirm_timeout makes that commit a persistent
+netconf-send-config-xml with confirm_timeout makes that commit a persistent
 confirmed commit: the change is live, but the device reverts it by itself when
 the timer runs out unless netconf-confirm-commit is called with the returned
 persist_id first (netconf-cancel-commit rolls it back immediately). The timer
@@ -45,9 +42,6 @@ lives on the device, so it fires even if the caller dies. Devices without
 netconf-save-config copies running-config to startup-config (write memory)
 after a successful push, so the change survives a reload. With a confirmed
 commit, save only after netconf-confirm-commit succeeds.
-
-netconf-discard clears a dirty candidate out of band (e.g. after a refused
-preview) — it does not pair with any staging mode, there isn't one.
 
 Connection parameters are read from stdin as JSON in the gateway5
 InventoryInfo format:
@@ -61,17 +55,14 @@ InventoryInfo format:
 CLI flags for connection params override stdin values — useful for local
 testing.
 
-Unverified for this fleet (fail loudly rather than guess if these turn out
-to matter):
-  - Whether Cisco-IOS-XE-cli-rpc is present on 17.12.4, and at which revision.
-  - Whether get-modelled-config-clis exists on IE 3400 / IE 3500 at 17.15.5
-    (confirmed on 17.15 generally, not on the IoT platforms).
-  - Whether candidate-datastore is available/enabled across all four
-    platform families on both trains.
-  - What get-modelled-config-clis silently omits per platform.
-  - Realistic render duration on a CAT 9500 core config (only ~17s on a
-    CSR1000v lab device is measured, a different platform family entirely).
-  - hostkey_verify=False — hardening item for production review.
+Known limits: the connection uses hostkey_verify=False (hardening item for
+production review); what get-modelled-config-clis silently omits per platform
+is not confirmed (a non-empty error-message is surfaced as `warning`).
+
+Not yet verified on a device: NX-OS netconf-confirm-commit and netconf-save-config
+(the code paths exist, offline-tested only); other IOS XE models and trains (e.g.
+IE 3400 / IE 3500, 17.12.x) are untested, and if the CLI render RPC is missing
+the preview falls back to xml-diff.
 """
 
 import argparse
@@ -274,7 +265,7 @@ FAST_PREVIEW_IOSXE_TRAINS = ("17.15",)
 def _fast_preview_allowed(m, platform: str) -> bool:
     """True only for IOS XE on a train in FAST_PREVIEW_IOSXE_TRAINS, from the same small version read
     is-alive uses. An "unknown" platform gets the IOS XE read too (like is-alive's fallback): an IOS XE
-    switch may list its YANG modules only through yang-library and not in the hello (the lab C9500 stack on
+    switch may list its YANG modules only through yang-library and not in the hello (a Catalyst 9500 stack on
     17.15 does), so the version read decides. A failed or unparsable read, NX-OS or another train is
     False: the preview then runs the original flow (dirty check first with full XML reads, plain XML hash)."""
     if platform not in ("iosxe", "unknown"):
@@ -349,37 +340,6 @@ def get_config(conn, args) -> dict:
             return {"success": True, "host": conn["host"], "source": args.source, "config": config_xml}
     except Exception as e:
         return {"success": False, "host": conn["host"], "error": str(e), "error_type": type(e).__name__}
-
-
-def get_config_clis(conn, args) -> dict:
-    """Render a datastore as CLI text via get-modelled-config-clis."""
-    datastore = args.source or "running"
-    try:
-        with _session(conn) as m:
-            result, error = _get_modelled_config_clis(m, datastore)
-            if error and result is None:
-                return {
-                    "success": False,
-                    "host": conn["host"],
-                    "datastore": datastore,
-                    "error": error,
-                    "error_type": "RPCError",
-                }
-            return {
-                "success": True,
-                "host": conn["host"],
-                "datastore": datastore,
-                "config": result or "",
-                # Surfaced even on success — a non-empty error-message alongside a
-                # result can mean partial render (e.g. an unsupported feature was
-                # skipped rather than raising). Don't swallow it — whether
-                # unsupported features error or silently omit is still unconfirmed
-                # per-platform; this at least reports it when the device does tell us.
-                "warning": error,
-            }
-    except Exception as e:
-        return {"success": False, "host": conn["host"], "datastore": datastore,
-                "error": str(e), "error_type": type(e).__name__}
 
 
 def _acquire_candidate_lock(m, timeout: int, poll_interval: float) -> float:
@@ -465,7 +425,7 @@ def _cli_hash(text: str) -> str:
     "cli-sha256:" + the full sha256 of the normalized text. The prefix tells the
     push which source to re-fingerprint, so a hash never gets compared against
     the other kind. The ONE helper both netconf-preview-config (running_hash)
-    and netconf-send-command (expect_running_hash drift guard) use."""
+    and netconf-send-config-xml (expect_running_hash drift guard) use."""
     return _CLI_HASH_PREFIX + hashlib.sha256(_normalize_text(text).encode("utf-8")).hexdigest()
 
 
@@ -489,7 +449,7 @@ def _unresolved_secret_placeholder(config_xml, conn, device_name):
 
 class _Steps:
     """Wall-clock laps of one preview, reported as timings.steps / timings.driver_total_s so a live
-    run shows where the time goes (the 10-06 live run took ~222 s while the two CLI renders added up to
+    run shows where the time goes (a live run on a Catalyst 9500 stack took ~222 s while the two CLI renders added up to
     only 22 s + 36 s)."""
 
     def __init__(self):
@@ -779,7 +739,7 @@ def preview_config(conn, args) -> dict:
             background = _start_background_render(conn, "running") if cli_render else None
 
             # IOS XE: lock first. A granted lock proves the candidate is clean (RFC 6241 section 7.5), which
-            # skips the two full get-config reads (~64 s + ~74 s on the lab switch). NX-OS keeps the dirty
+            # skips the two full get-config reads (~64 s + ~74 s on a Catalyst 9500 stack). NX-OS keeps the dirty
             # check first (lock-on-dirty is not confirmed there).
             # Only on a proven train (see FAST_PREVIEW_IOSXE_TRAINS); any other train, a failed version read
             # or NX-OS runs the original order below.
@@ -950,7 +910,7 @@ def preview_config(conn, args) -> dict:
                 "committed": False}
 
 
-def send_command(conn, args) -> dict:
+def send_config_xml(conn, args) -> dict:
     """Push config_xml for real: lock candidate, discard any stray staged
     content, edit, commit. The supported flow is netconf-preview-config
     (stage -> diff -> discard) followed by a separate call here — there is
@@ -976,7 +936,7 @@ def send_command(conn, args) -> dict:
     config_xml = getattr(args, "config_xml", None)
     if not config_xml:
         return {"success": False, "host": conn["host"], "device_name": device_name,
-                "error": "config_xml is required for action=netconf-send-command"}
+                "error": "config_xml is required for action=netconf-send-config-xml"}
     unresolved = _unresolved_secret_placeholder(config_xml, conn, device_name)
     if unresolved:
         return unresolved
@@ -1149,44 +1109,6 @@ def send_command(conn, args) -> dict:
                 "error": str(e), "error_type": type(e).__name__}
 
 
-def discard(conn, args) -> dict:
-    """Discard whatever is staged in the candidate datastore — e.g. to
-    clear a dirty candidate flagged by netconf-preview-config
-    (error_type=DirtyCandidate) without going through force_discard on the
-    next preview call, or to recover from a partially-applied edit."""
-    device_name = conn.get("device_name") or conn["host"]
-    try:
-        with _session(conn) as m:
-            if not _has_candidate(m):
-                return {"success": False, "host": conn["host"], "device_name": device_name,
-                        "error": "device has no candidate datastore — nothing to discard"}
-            lock_wait = _acquire_candidate_lock(m, conn["lock_timeout"], conn["lock_poll_interval"])
-            try:
-                m.discard_changes()
-                return {
-                    "success": True,
-                    "host": conn["host"],
-                    "device_name": device_name,
-                    "lock_wait_seconds": round(lock_wait, 2),
-                }
-            finally:
-                try:
-                    m.unlock(target="candidate")
-                except Exception:
-                    pass
-    except RPCError as e:
-        return {"success": False, "host": conn["host"], "device_name": device_name,
-                "error": str(e), "error_type": "RPCError",
-                "rpc_tag": getattr(e, "tag", None),
-                "rpc_type": getattr(e, "type", None),
-                "rpc_severity": getattr(e, "severity", None),
-                "rpc_info": getattr(e, "info", None),
-                "rpc_path": getattr(e, "path", None)}
-    except Exception as e:
-        return {"success": False, "host": conn["host"], "device_name": device_name,
-                "error": str(e), "error_type": type(e).__name__}
-
-
 def _rpc_failure(conn, device_name, e) -> dict:
     return {"success": False, "host": conn["host"], "device_name": device_name,
             "error": str(e), "error_type": "RPCError",
@@ -1199,7 +1121,7 @@ def _rpc_failure(conn, device_name, e) -> dict:
 
 def confirm_commit(conn, args) -> dict:
     """Confirm a pending persistent confirmed commit started by
-    netconf-send-command with confirm_timeout. Sends the confirming <commit>
+    netconf-send-config-xml with confirm_timeout. Sends the confirming <commit>
     carrying the persist_id, which makes the change permanent in running. It
     does NOT save to startup — run netconf-save-config after this succeeds.
 
@@ -1257,8 +1179,7 @@ def cancel_commit(conn, args) -> dict:
 
 # Two ways IOS XE exposes "write memory" over NETCONF. Which one a given
 # image carries is not advertised reliably, so try them in order and report
-# which one worked. (A lab switch was reported without cisco-ia on an earlier image —
-# hence the fallback.)
+# which one worked. (Some images lack cisco-ia — hence the fallback.)
 _SAVE_CONFIG_RPCS = [
     ("cisco-ia:save-config", '<save-config xmlns="http://cisco.com/yang/cisco-ia"/>'),
     ("Cisco-IOS-XE-rpc:copy",
@@ -1278,71 +1199,12 @@ _NXOS_SAVE_CONFIG_RPCS = [
 ]
 
 
-_BACKUP_FILESYSTEMS = ("flash", "bootflash")
-
-
-def _backup_filesystem(args):
-    """The optional backup_filesystem argument, or None when unset/empty."""
-    value = getattr(args, "backup_filesystem", None)
-    return value if isinstance(value, str) and value != "" else None
-
-
-def _backup_config(conn, device_name, filesystem) -> dict:
-    """Copy running-config to <filesystem>:backup-<UTC YYYYMMDD-HHMMSS> with the
-    Cisco-IOS-XE-rpc copy RPC (no cisco-ia path: it can only write startup).
-    The startup-config is not touched."""
-    destination = f"{filesystem}:backup-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-    rpc_xml = ('<copy xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-rpc">'
-               "<source-drop-node-name>running-config</source-drop-node-name>"
-               f"<destination-drop-node-name>{destination}</destination-drop-node-name>"
-               "</copy>")
-    try:
-        with _session(conn) as m:
-            if _detect_platform(m) == "nxos":
-                return {"success": False, "host": conn["host"], "device_name": device_name,
-                        "error": "backup_filesystem is not supported on NX-OS",
-                        "error_type": "NotSupported"}
-            reply = m.dispatch(to_ele(rpc_xml))
-            xml_str = reply.xml if hasattr(reply, "xml") else str(reply)
-            tree = _etree.fromstring(xml_str.encode() if isinstance(xml_str, str) else xml_str)
-            result_nodes = tree.xpath(".//*[local-name()='result']")
-            result_text = result_nodes[0].text.strip() if result_nodes and result_nodes[0].text else None
-            # a copy that answers without an rpc-error but says error/fail in its result text is not a backup
-            if result_text and re.search(r"error|fail", result_text, re.I):
-                return {"success": False, "host": conn["host"], "device_name": device_name,
-                        "error": result_text, "error_type": "BackupFailed", "destination": destination}
-            return {
-                "success": True,
-                "host": conn["host"],
-                "device_name": device_name,
-                "method": "Cisco-IOS-XE-rpc:copy",
-                "destination": destination,
-                "result": result_text,
-            }
-    except RPCError as e:
-        return dict(_rpc_failure(conn, device_name, e), destination=destination)
-    except Exception as e:
-        return {"success": False, "host": conn["host"], "device_name": device_name,
-                "error": str(e), "error_type": type(e).__name__, "destination": destination}
-
-
 def save_config(conn, args) -> dict:
     """Persist running-config to startup-config (NETCONF equivalent of
     `write memory`). A committed change only reaches running; without this a
     reload silently reverts it. Saves the WHOLE running config, not just the
-    last change.
-
-    With backup_filesystem (flash or bootflash) set it instead copies running
-    to a timestamped file on that filesystem and leaves startup alone; the
-    file URL comes back as `destination`."""
+    last change."""
     device_name = conn.get("device_name") or conn["host"]
-    backup_fs = _backup_filesystem(args)
-    if backup_fs is not None:
-        if backup_fs not in _BACKUP_FILESYSTEMS:
-            return {"success": False, "host": conn["host"], "device_name": device_name,
-                    "error": f"backup_filesystem must be one of {list(_BACKUP_FILESYSTEMS)}, got {backup_fs!r}",
-                    "error_type": "InvalidBackupFilesystem"}
-        return _backup_config(conn, device_name, backup_fs)
     attempts = []
     try:
         with _session(conn) as m:
@@ -1516,10 +1378,10 @@ def existing_config_check(conn, args) -> dict:
 _DISPATCH = {
     "netconf-is-alive": is_alive,
     "netconf-get-config": get_config,
-    "netconf-get-config-clis": get_config_clis,
     "netconf-preview-config": preview_config,
-    "netconf-send-command": send_command,
-    "netconf-discard": discard,
+    "netconf-send-config-xml": send_config_xml,
+    # Gateways imported before this version still send the old op name.
+    "netconf-send-command": send_config_xml,
     "netconf-save-config": save_config,
     "netconf-existing-config-check": existing_config_check,
     "netconf-confirm-commit": confirm_commit,
@@ -1624,25 +1486,22 @@ def build_parser() -> argparse.ArgumentParser:
                              "datastore is dirty (differs from running), discard it and proceed "
                              "instead of returning error_type=DirtyCandidate.")
     parser.add_argument("--expect_running_hash", "--expect-running-hash", dest="expect_running_hash", default=None,
-                        help="netconf-send-command only — optional drift guard. If set, running "
+                        help="netconf-send-config-xml only — optional drift guard. If set, running "
                              "config is re-fingerprinted before applying; a mismatch returns "
                              "error_type=ConfigDrift instead of applying.")
     parser.add_argument("--config_xml", "--config-xml", dest="config_xml", default=None,
                         help="A complete, pre-built NETCONF <config> XML payload — pushed as-is via "
                              "edit-config. Required for netconf-preview-config and "
-                             "netconf-send-command.")
+                             "netconf-send-config-xml.")
     parser.add_argument("--confirm_timeout", "--confirm-timeout", dest="confirm_timeout",
                         type=_optional_int, default=None,
-                        help="netconf-send-command only — seconds. If set, the commit is a persistent "
+                        help="netconf-send-config-xml only — seconds. If set, the commit is a persistent "
                              "confirmed commit: the device rolls the change back on its own unless "
                              "netconf-confirm-commit is called with the returned persist_id in time. "
                              "Unset = plain commit.")
     parser.add_argument("--persist_id", "--persist-id", dest="persist_id", default=None,
                         help="netconf-confirm-commit / netconf-cancel-commit — the persist_id "
-                             "returned by the netconf-send-command call that started the confirmed commit.")
-    parser.add_argument("--backup_filesystem", "--backup-filesystem", dest="backup_filesystem", default=None,
-                        help="netconf-save-config only — flash or bootflash. If set, copy running-config to "
-                             "<filesystem>:backup-<UTC timestamp> instead of saving to startup.")
+                             "returned by the netconf-send-config-xml call that started the confirmed commit.")
     parser.add_argument("--source", "--datastore", dest="source", default=None)
     parser.add_argument("--filter", default=None)
     return parser
@@ -1650,7 +1509,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _normalize_args(args):
     for attr in ("source", "filter", "host", "user", "password", "config_xml", "expect_running_hash",
-                 "persist_id", "backup_filesystem"):
+                 "persist_id"):
         if getattr(args, attr, None) == "":
             setattr(args, attr, None)
 
@@ -1683,14 +1542,6 @@ def _format_for_humans(result, op):
         if not result.get("success"):
             return f"ERROR: {result.get('error', 'config retrieval failed')}"
         return result.get("config", "")
-
-    if op == "netconf-get-config-clis":
-        if not result.get("success"):
-            return f"ERROR: {result.get('error', 'CLI render failed')}"
-        text = result.get("config", "")
-        if result.get("warning"):
-            text = f"{text}\n\n# WARNING: {result['warning']}"
-        return text
 
     return json.dumps(result, indent=2, default=str)
 

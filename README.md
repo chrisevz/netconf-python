@@ -1,284 +1,113 @@
-# netconf-python — IAG5 Python script service (Cisco IOS XE)
+# netconf-python
 
-A single-use-case NETCONF driver: **push an XML payload to a Cisco IOS XE device via
-NETCONF, and render it as CLI text (or, where unavailable, a structural XML diff) for
-human approval before it is committed.**
+An Itential IAG5 Python-script driver that pushes a pre-built NETCONF `<config>` XML
+payload to a Cisco device, with a preview first and a safe way back. Platforms: **Cisco
+IOS XE** and **NX-OS**. Transport is NETCONF over SSH (port 830).
 
-Transport: NETCONF over SSH (port 830), DMI `netconf-yang`.
+Verified on IOS XE 17.15.5 (Catalyst 9500 stack, including the device-rendered preview and
+confirmed commit) and NX-OS 10.5(5) (Nexus 9000v: is-alive, candidate get-config, xml-diff
+preview, confirmed commit and cancel from a new session).
 
-**Fleet:**
+## Services
 
-| Platform | Models | N | N-1 |
-|---|---|---|---|
-| Catalyst access | IE 3400, IE 3500, CAT 9300/9400 | 17.15.5 | 17.12.4 |
-| Catalyst core | CAT 9500 | 17.15.5 | 17.12.4 |
+Each service reads the device from the gateway inventory and returns JSON with `success`
+(plus `error` / `error_type` on failure). All accept `timeout` (seconds, default 90).
 
-NX-OS is out of scope for this driver (see git history if that work resumes as a
-later phase — it isn't part of this repo anymore).
+| Service | What it does | Platforms | Key inputs | Key outputs |
+|---|---|---|---|---|
+| `netconf-is-alive` | NETCONF reachability and device facts | IOS XE, NX-OS | - | `alive`, `output` (software version), `platform`, `capabilities`, `persist_confirmed_commit` |
+| `netconf-get-config` | Read running or candidate config as XML | IOS XE, NX-OS | `source`, `filter` | `config` |
+| `netconf-preview-config` | Stage `config_xml` into candidate, diff against running, discard. Never commits | IOS XE, NX-OS (NX-OS = `xml-diff`) | `config_xml`, `force_discard`, `diff`, `lock_timeout` | `diff`, `diff_rows`, `diff_stats`, `running_hash`, `preview_mode`, `timings` |
+| `netconf-send-config-xml` | Push `config_xml` (lock, edit, validate, commit) | IOS XE, NX-OS | `config_xml`, `expect_running_hash`, `confirm_timeout`, `lock_timeout` | `commit`, `confirmed_commit`, `drift_check`, and with `confirm_timeout` also `persist_id`, `confirm_deadline_utc` |
+| `netconf-confirm-commit` | Make a pending confirmed commit permanent | IOS XE, NX-OS | `persist_id` | `success` |
+| `netconf-cancel-commit` | Roll a pending confirmed commit back now | IOS XE, NX-OS | `persist_id` | `success`, `rolled_back` |
+| `netconf-save-config` | Copy running to startup (write memory) | IOS XE (`cisco-ia:save-config`, else `Cisco-IOS-XE-rpc:copy`), NX-OS (`copy_running_config_src`) | - | `method` |
+| `netconf-existing-config-check` | Read-only: does the device already carry configuration? | IOS XE only (NX-OS returns `NotSupported`) | - | `found`, `findings` (capped at 20), `findings_total` |
 
-## Actions
+## Typical flow
 
-| Action | Purpose | Notes |
-|---|---|---|
-| `netconf-is-alive` | Confirm device responds to NETCONF | Returns JSON with `alive`, `output` (software version via `<get>`: IOS XE native model, e.g. `17.15`, or NX-OS `nxosVersion`, e.g. `10.5(5)`), `platform` (`iosxe`/`nxos`/`unknown`, from advertised modules), `capabilities` (booleans: candidate, validate, confirmed-commit 1.0/1.1, writable-running, rollback-on-error, startup) and `base_capabilities` (the `urn:ietf:params:netconf:` ones only). A failed version read never fails the check: `output` is empty and `version_error` is set |
-| `netconf-save-config` | Copy running-config to startup-config (write memory) after a push | IOS XE: tries `cisco-ia:save-config`, falls back to `Cisco-IOS-XE-rpc` `copy`. NX-OS: `copy_running_config_src` from the `cisco-nx-os-device` model (Cisco-documented since 9.2(1)). Result says which `method` worked. Saves the whole running config. With `backup_filesystem` (`flash` or `bootflash`) it instead copies running to `<fs>:backup-<UTC YYYYMMDD-HHMMSS>` via the `Cisco-IOS-XE-rpc` `copy` RPC and returns that `destination`; startup is untouched, any other value is refused before a session opens, NX-OS returns `NotSupported` |
-| `netconf-existing-config-check` | Read-only: does the device already carry configuration? | One `get-config` of running with a narrow filter (physical interfaces + Port-channel, `aaa`, `tacacs` server names); no lock, no candidate. Returns `found`, `findings` (short lines, capped at 20) and `findings_total`, never raw config or keys. A finding is a port (not the Mgmt-vrf / `GigabitEthernet0/0` port) with an access VLAN other than 1, a switchport mode, a trunk allowed list or a channel-group; any Port-channel; any AAA entry; any TACACS server. A description alone does not count. NX-OS returns `NotSupported` |
-| `netconf-get-config` | Retrieve running or candidate configuration | XML only |
-| `netconf-get-config-clis` | Render running or candidate as CLI text | Uses `get-modelled-config-clis` (`Cisco-IOS-XE-cli-rpc`) — the device's own modelled-config-to-CLI renderer. This is the mechanism behind `netconf-preview-config`'s `preview_mode="device-rendered"` outcome. |
-| `netconf-preview-config` | **The core feature.** Stage a proposed `config_xml` change, diff it against running, then discard | Never commits. See "Preview and push workflow" below. |
-| `netconf-send-command` (service name: `netconf-send-config-xml`) | Apply `config_xml` for real (commit) | The only push path — see below. |
-| `netconf-discard` | Discard whatever is staged in candidate | Clears a dirty candidate (e.g. one flagged by a preview call) out of band. |
-| `netconf-confirm-commit` | Confirm a pending persistent confirmed commit | Takes the `persist_id` returned by a push that used `confirm_timeout`. Makes the change permanent in running; does not save to startup. Fails if the device's timer already rolled the change back. |
-| `netconf-cancel-commit` | Roll a pending persistent confirmed commit back now | Takes the same `persist_id`. |
+1. `netconf-preview-config` with `config_xml`. A person reviews the `diff`.
+2. `netconf-send-config-xml` with the same `config_xml`, `expect_running_hash` set to the
+   preview's `running_hash`, and `confirm_timeout` (seconds).
+3. Verify the change, then `netconf-confirm-commit` with the returned `persist_id`
+   (or `netconf-cancel-commit` to roll back).
+4. `netconf-save-config` to persist to startup.
 
-### Confirmed push (`confirm_timeout`)
+## Behavior notes
 
-`netconf-send-config-xml` with `confirm_timeout` (seconds) does a **persistent confirmed
-commit** (RFC 6241 `:confirmed-commit:1.1`): the change goes live, but the **device**
-reverts it on its own when the timer runs out unless `netconf-confirm-commit` is called
-with the returned `persist_id` first. Because the timer lives on the device, a dead
-workflow, gateway or process still ends in a rollback. Results carry `persist_id`,
-`confirm_timeout` and `confirm_deadline_utc`.
+- **The device owns the rollback timer.** With `confirm_timeout`, the push is a persistent
+  confirmed commit (RFC 6241, `:confirmed-commit:1.1`). The change is live, and the device
+  reverts it by itself unless `netconf-confirm-commit` arrives with the `persist_id` in
+  time, so a dead workflow or gateway still ends in a rollback. A device without 1.1 is
+  refused (`error_type=NoConfirmedCommit`) before anything is edited; there is no fallback
+  to a plain commit. Confirm fails if the timer already ran out. Save to startup only after
+  a successful confirm. Without `confirm_timeout` the push is a plain commit.
+- **Drift guard.** `expect_running_hash` is the `running_hash` from the preview. If running
+  config changed since, the push is refused with `error_type=ConfigDrift`. If the check
+  cannot be made on IOS XE it fails closed (`DriftCheckUnavailable`).
+- **Dirty candidate.** If the candidate datastore holds uncommitted changes from another
+  session, preview returns `error_type=DirtyCandidate` with a `dirty_diff`.
+  `force_discard=true` discards them and proceeds. A lock held by another session past
+  `lock_timeout` returns `CandidateLocked`.
+- **Secrets.** `netconf-preview-config` and `netconf-send-config-xml` refuse a `config_xml`
+  that still contains an unresolved `$GATEWAYSECRET_` placeholder, so a literal
+  placeholder is never sent to a device.
+- **`netconf-existing-config-check`** never returns config text or keys, only short
+  finding lines.
+- **`preview_mode`** is always present: `device-rendered` (the device's own CLI render,
+  IOS XE 17.15.5-class images) or `xml-diff` (structural XML diff: NX-OS, and IOS XE images
+  without the render RPC).
+- The preview also returns `diff_rows` (side-by-side data: changed lines plus 3 lines of
+  context, capped at 5000 rows, raw text, not HTML-escaped) and `timings` per step.
+- The driver connects with `hostkey_verify=False`; review before wider production use.
+- **Not yet verified on a device:** NX-OS `netconf-confirm-commit` and `netconf-save-config`
+  (the code paths exist and are tested offline only). Other IOS XE models and trains (for
+  example IE 3400 / IE 3500, 17.12.x) are untested; if the CLI render RPC is missing, the
+  preview falls back to `xml-diff`.
 
-- **Fails closed:** a device that does not advertise `:confirmed-commit:1.1` is refused
-  (`error_type=NoConfirmedCommit`) before anything is edited — there is no fallback to a
-  plain commit. Version 1.0 is not enough: its confirmed commit reverts as soon as the
-  pushing session closes, and every service call is a new session.
-- `netconf-is-alive` reports `persist_confirmed_commit` so a workflow can refuse such a
-  device before any operator time is spent.
-- Save to startup (`netconf-save-config`) only **after** `netconf-confirm-commit` succeeds.
-- If the commit reply is lost, the failure result still carries `persist_id` with
-  `confirmed_commit_state=unknown`; the device reverts it at the timer regardless.
-- Leaving `confirm_timeout` unset keeps the old plain-commit behaviour.
+## Requirements
 
-## Preview and push workflow
+- Python 3 with `ncclient==0.6.19` and `lxml==5.2.2` (`requirements.txt`; the versions these
+  services were tested with on the gateway).
+- On the device: NETCONF enabled and port 830 reachable from the gateway. IOS XE:
+  `netconf-yang`, plus `netconf-yang feature candidate-datastore` for candidate/commit.
+- Inventory node attributes: `itential_host`, `itential_user`, `itential_password`, and
+  optionally `itential_driver_options.netconf` (`port`, `timeout`, `lock_timeout`,
+  `lock_poll_interval`).
 
-1. **Preview:** call `netconf-preview-config` with `config_xml`. This locks candidate,
-   applies the config, diffs it against running, and discards — all in one call, leaving
-   zero state on the device. Returns a `diff`, a `running_hash` fingerprint, and
-   `preview_mode` (see below). A human reviews the diff.
-2. **Push:** once approved, call `netconf-send-config-xml` with the *same* `config_xml`,
-   optionally passing `expect_running_hash` set to the `running_hash` from step 1. This
-   locks candidate, discards any stray staged content, edits, and commits in one call. If
-   `expect_running_hash` is set and running config has drifted since the preview captured
-   its hash, the push is refused with `error_type=ConfigDrift` rather than applying an
-   approved diff against config that has since moved (see "`expect_running_hash` drift guard").
+## Import into IAG5
 
-There is no separate stage-then-later-finish step. `config_xml` is generated upstream
-(Jinja2 or similar) once and used for both calls.
+1. Put this code in your own repository.
+2. In `import.yaml` set `url` to that repository and set `reference` to a release tag. The
+   gateway pulls the repository on every service execution, so a branch reference would
+   deploy every merge immediately.
+3. Import, then check the services:
+   ```bash
+   iagctl db import import.yaml --repository netconf-python --force
+   ```
+4. Import adds and replaces by name but never deletes. List what the gateway has with
+   `iagctl get services` and `iagctl get decorators`, and remove anything no longer in
+   `import.yaml`. Delete the services first, then their decorators (delete does not check
+   references), and check workflow bindings before deleting a service:
+   ```bash
+   iagctl delete service <name>
+   iagctl delete decorator <name>
+   ```
+   Older iagctl versions take `iagctl delete service python-script <name>`.
 
-## `preview_mode`
+Service names are stable. `main.py` still accepts the old internal op name
+`netconf-send-command` for `netconf-send-config-xml`, so a gateway imported before the
+rename keeps working.
 
-`netconf-preview-config`'s result always includes a `preview_mode` field — never absent,
-never guessed:
-
-| Value | Meaning |
-|---|---|
-| `"device-rendered"` | The diff came from the device's own CLI renderer (`get-modelled-config-clis`). Expected on 17.15.5-class images. |
-| `"xml-diff"` | Structural fallback: a diff of plain `get-config` XML text. Used when `get-modelled-config-clis` is unsupported — expected on 17.12.4, which most likely carries a `Cisco-IOS-XE-cli-rpc` revision that predates `get-modelled-config-clis`. |
-
-Both modes run the identical lock/edit/validate/discard sequence — only the render-and-diff
-step differs. An operator approving a change needs to know which one they're looking at.
-
-### Side-by-side diff data and render timing
-
-Besides the unified `diff` text, the preview result carries the same diff as plain data for a
-side-by-side view (old on the left, new on the right):
-
-- `diff_rows`: a list of rows. `{"kind": "same" | "change", "old_no", "old", "old_mark", "new_no", "new", "new_mark"}`
-  where `*_no` is the 1-based line number on that side (`null` when that side has no line in the row)
-  and `*_mark` is `"del"` (removed or changed on the old side), `"add"` (added or changed on the new
-  side) or `""`; or `{"kind": "gap", "hidden": N}` for N unchanged lines that are not shown. Only the
-  changed lines plus 3 lines of context are returned, capped at 5000 rows. Changed blocks are paired line
-  by line. Text is raw, not HTML-escaped: escaping is the job of whoever draws it.
-- `diff_stats`: `{"added", "removed", "truncated"}`.
-- `timings`: `running_render_s`, `candidate_render_s`, `render_wall_s` (time the main session spent in the render step: the candidate render plus any wait for the running render; equal to the candidate render when the running render had already finished), `parallel`, `steps` (seconds per phase. IOS XE: `connect`, `lock`, `edit_config`, `validate`, `render`, `discard_unlock`; there are no `get_running_xml` / `get_candidate_xml` steps any more because the lock is taken first. In `"xml-diff"` mode `get_running_xml_after_edit` and `get_candidate_xml_after_edit` appear too, already part of the `render` time. On the dirty-candidate path (lock refused) `lock_refused`, `get_running_xml`, `get_candidate_xml` and, with `force_discard`, a second `lock` appear. NX-OS keeps `connect`, `get_running_xml`, `get_candidate_xml`, `lock`, `edit_config`, `validate`, `render`, `discard_unlock`, plus `get_candidate_xml_after_edit`) and `driver_total_s` (the script's own total, to compare with the task time in the workflow). The CLI render of
-  running (a slow step) runs in a second read-only NETCONF session that starts right after the candidate
-  capability check, so it overlaps the staging work (lock, edit, validate); the candidate
-  render follows the edit. If the second session cannot be opened or fails, running is rendered in the
-  main session afterwards and `parallel` is `false`.
-  Live measurement on a Catalyst 9500 stack (10-06, before this ordering): 220 s in total, of which the three
-  plain `get-config` reads took 195 s (running 47 s, candidate 74 s, candidate after the edit 74.5 s), the wait
-  for the CLI render 22 s (the running render of 36 s had already finished) and everything else 3 s. The
-  post-edit candidate read is now done only in `"xml-diff"` mode, and the running render starts earlier; not
-  yet measured live.
-
-`diff: false` drops `diff`, `diff_rows` and `diff_stats`.
-
-**Unverified, TODO — do not assume:**
-- Whether `Cisco-IOS-XE-cli-rpc` is present on 17.12.4, and at which revision.
-- Whether `get-modelled-config-clis` exists on IE 3400 / IE 3500 at 17.15.5 (confirmed on
-  17.15 generally, not on the IoT platforms).
-- What `get-modelled-config-clis` silently omits per platform (Cisco's docs say
-  wireless/app-hosting/telemetry aren't supported through it; whether that means an error
-  or a silent omission from the render is unconfirmed). A non-empty `error-message`
-  alongside a result surfaces as `warning` rather than being swallowed — but an omission
-  with no `error-message` at all would currently go unnoticed.
-- Realistic render duration on a CAT 9500 core config — only ~17s on a CSR1000v lab
-  device is measured, a different platform family entirely from this fleet.
-
-## Candidate datastore locking
-
-`netconf-preview-config` and `netconf-send-command` auto-detect whether the device
-advertises the candidate datastore capability (parsed from the capability URN, not a
-substring match). If present, both take an exclusive lock before touching candidate. If
-not, `netconf-send-command` edits `running` directly.
-
-If the lock cannot be taken (another session holds it past `lock_timeout`, or the device
-refuses it for another reason), both return `success=false`, `error_type=CandidateLocked`,
-the device's message in `error`, `rpc_tag`, `lock_wait_seconds` and `committed=false`.
-Nothing was edited or committed.
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--lock_timeout` | `30` | Max seconds to wait. `0` = fail immediately. |
-| `--lock-poll-interval` | `2.0` | Seconds between retries. |
-
-Lock-denied retries match on `error-tag == "lock-denied"` only — not on message-string
-sniffing, which was validated against exactly one 17.15 device and isn't guaranteed to
-hold on a different DMI build (e.g. IE 3400 on 17.12.4). Any other RPC error during lock
-acquisition is treated as fatal, not transient (reported as `CandidateLocked`, or, in the
-preview on IOS XE, first checked for a dirty candidate — see below).
-
-**Unverified, TODO:** whether `candidate-datastore` is available and enabled across all
-four platform families on both trains.
-
-## Fast preview gate and path labels
-
-The lock-first preview and the CLI-render fingerprint run only when the platform is detected as IOS XE
-(`iosxe`, from the hello) AND the software train (major.minor, from the same small version read
-`netconf-is-alive` uses) is in `FAST_PREVIEW_IOSXE_TRAINS` in `main.py`, initially `("17.15",)`, the one
-train proven live. NX-OS, an undetected platform, another train, or a failed or unparsable version read
-all run the original flow: dirty check first with full `get-config` reads, then the lock, plain XML hash.
-
-Results say which path ran (add-only fields):
-- Preview: `dirty_check` is `"lock-first"` or `"full-read"`; `fingerprint` (success only) is `"cli"` or `"xml"`.
-- Push: `drift_check` is `"cli"`, `"xml"` or `"none"` (no `expect_running_hash`).
-The preview adds a `version_read` step to `timings.steps` on IOS XE.
-
-## Dirty-candidate handling
-
-RFC 6241 §7.5: a lock on the candidate datastore MUST NOT be granted if it has uncommitted
-changes. Confirmed live on IOS XE 17.15 (`operation-failed`, "there are outstanding changes
-to the database"). So on IOS XE `netconf-preview-config` takes the lock FIRST: a granted lock
-proves the candidate is clean, and the two full `get-config` reads (running, candidate) that
-used to run before the edit are skipped.
-
-If the lock is refused with a tag other than `lock-denied`, the preview runs the dirty check
-(plain `get-config` of running and candidate, compared):
-
-- Dirty, default: refused with `error_type=DirtyCandidate` and a `dirty_diff` showing what's there.
-- Dirty, `force_discard=true`: discards it (`discard-changes` needs no lock, RFC 6241 §8.3.4.2),
-  takes the lock again and proceeds.
-- Not dirty: `error_type=CandidateLocked` (the refusal had another cause).
-
-A `lock-denied` that outlasts `lock_timeout` means another session holds the lock: `CandidateLocked`
-straight away, no reads.
-
-NX-OS keeps the original order (not confirmed there): the dirty check first, with plain
-`get-config` reads, then the lock.
-
-## `expect_running_hash` drift guard
-
-`running_hash` (preview) and `expect_running_hash` (push) come in two forms, told apart by prefix:
-
-- `cli-sha256:<64 hex>` — IOS XE with a CLI render available (`preview_mode="device-rendered"`):
-  the sha256 of the normalized running CLI render the diff used. The preview does no full running
-  XML read for it. The push re-renders running in its own session (`get-modelled-config-clis`)
-  before taking the lock, hashes it with the same helper and compares. If the render is
-  unavailable or fails, the push is refused with `error_type=DriftCheckUnavailable` (fail closed;
-  no lock, edit or commit).
-- 16 hex chars, no prefix — the plain hash of the running-config XML: what the preview returns in
-  `preview_mode="xml-diff"` and on NX-OS, and what an older driver returned. The push compares it
-  against a fresh `get-config` of running, as before.
-
-A mismatch in either form is refused with `error_type=ConfigDrift`.
-
-## Local development
+## Run locally and test
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-NETCONF_OP=netconf-is-alive python main.py \
-  --host 192.0.2.1 --user admin --password "$PASS"
+NETCONF_OP=netconf-is-alive python main.py --host 192.0.2.1 --user admin --password "$PASS"
+NETCONF_OP=netconf-preview-config python main.py --host 192.0.2.1 --user admin \
+  --password "$PASS" --config_xml '<config>...</config>'
 
-NETCONF_OP=netconf-preview-config python main.py \
-  --host 192.0.2.1 --user admin --password "$PASS" \
-  --config_xml '<config><native xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-native">...</native></config>'
-
-NETCONF_OP=netconf-send-command python main.py \
-  --host 192.0.2.1 --user admin --password "$PASS" \
-  --config_xml '<config>...</config>' \
-  --expect_running_hash abcdef0123456789
+python3 -m unittest test_main      # offline, no device needed
 ```
-
-CLI flags win over stdin values when both are present.
-
-### Tests
-
-```bash
-python -m unittest test_main -v
-```
-
-Offline, no device needed — covers text normalization/hashing, capability parsing,
-`preview_mode` selection (including the XML-diff fallback), the side-by-side diff rows, and the
-parallel render with its fallbacks, the lock-first preview (clean, dirty, force_discard, locked), the
-NX-OS call order, and the push drift guard (both hash forms, fail closed, `CandidateLocked`).
-
-## Recommended inventory attributes
-
-```json
-{
-  "name": "my-device",
-  "attributes": {
-    "itential_host": "192.0.2.1",
-    "itential_user": "admin",
-    "itential_password": "secret",
-    "itential_driver_options": {
-      "netconf": {
-        "port": 830,
-        "timeout": 90,
-        "lock_timeout": 30,
-        "lock_poll_interval": 2
-      }
-    }
-  }
-}
-```
-
-## Prerequisites on the device
-
-```
-netconf-yang
-! Optional — enables candidate datastore + commit + validate:
-netconf-yang feature candidate-datastore
-commit
-```
-
-Port 830 must be reachable from the IAG5 host.
-
-**Hardening item, out of scope here:** the driver connects with `hostkey_verify=False`.
-Flagged for production review, not addressed in this pass.
-
-## Deployment notes
-
-- **`main.py` needs no reload.** IAG5 pulls the pinned repository reference fresh on every
-  service execution.
-- **`import.yaml` does need a reload.** Decorators and service definitions live in the
-  gateway's data store, not in git:
-  ```bash
-  iagctl db import import.yaml --repository netconf-python --force
-  ```
-- **Import never deletes.** It only adds and replaces by matching name. A service removed
-  from `import.yaml` stays registered in the data store — still advertised, still showing
-  its old input schema — until explicitly removed:
-  ```bash
-  iagctl delete service python-script <name>
-  ```
-  Check Platform for workflow bindings to a removed service name before deleting it.
-- **This repo tracks `main`** (`reference: main` in `import.yaml`) — intentional here,
-  since this repo is for testing and every push should be immediately reflected on the
-  next service run. The production driver will live on a separate repo; pin *that* one's
-  reference to a tag/SHA before it's used against a live customer environment, since a
-  moving branch reference there would make every merge an unreviewed production deploy.
