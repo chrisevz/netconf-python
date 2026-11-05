@@ -88,6 +88,12 @@ Each service reads the device from the gateway inventory and returns JSON with `
   payload, returns `payload` and `unresolved_placeholders` (a count) and stops without
   connecting to a device (no inventory node is needed). A joined payload that holds a U+FFFD
   replacement character (a damaged character) is refused.
+- **StackWise Virtual ports.** Before the lock and any edit, `netconf-preview-config` and
+  `netconf-send-config-xml` read the interfaces the config names (`native/interface/<Type>/name`,
+  any type) from running, with a name-selection filter. If any of them carries
+  `stackwise-virtual`, the call returns `error_type=StackwiseVirtualPort` with
+  `protected_ports`, `committed=false`, and nothing is staged. A failed or unreadable read
+  refuses too. A config without native interface entries (for example NX-OS) skips the read.
 - **Existing-config check.** `netconf-existing-config-check` returns only short finding
   lines, never config text or keys.
 - **`preview_mode`** is always present. `device-rendered` is the device's own CLI text

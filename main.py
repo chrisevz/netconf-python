@@ -75,6 +75,7 @@ import sys
 import threading
 import time
 import uuid
+from xml.sax.saxutils import escape as _xml_escape
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -554,6 +555,79 @@ def _guarded_payload_call(conn, args, op_name, include_sha256, run):
     return _with_payload(run(conn, args, config_xml), config_xml, parts, include_sha256)
 
 
+_NATIVE_NS = "http://cisco.com/ns/yang/Cisco-IOS-XE-native"
+
+
+def _payload_interfaces(config_xml):
+    """[(Type, name)] for every native/interface/<Type>/name entry in the payload (any interface type, in order, no
+    duplicates). A payload without the IOS XE native namespace (NX-OS, anything else) gives []. Raises on XML that does
+    not parse (the caller refuses: fail closed)."""
+    root = _etree.fromstring(config_xml.encode("utf-8"), _etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=True))
+    found = []
+    for native in root.iter("{%s}native" % _NATIVE_NS):
+        for interface in native.findall("{%s}interface" % _NATIVE_NS):
+            for entry in interface:
+                if not isinstance(entry.tag, str):
+                    continue
+                name = entry.find("{%s}name" % _NATIVE_NS)
+                if name is not None and (name.text or "").strip():
+                    item = (_etree.QName(entry).localname, name.text.strip())
+                    if item not in found:
+                        found.append(item)
+    return found
+
+
+def _stackwise_guard(m, conn, device_name, config_xml):
+    """Refuse (failure result) when the payload touches an interface that carries `stackwise-virtual` in RUNNING; else None.
+
+    StackWise Virtual link and dual-active-detection ports hold the two switches of a pair together; a config that
+    shuts them or changes their mode can split the pair. Runs on an open session BEFORE the lock and any edit. It reads
+    only the interfaces the payload itself names (one get-config of running, name-selection subtree filter, the form proven
+    live); a payload with no native interface entries skips the read. Any failure to read or parse fails closed with the
+    same error_type. Never echoes config text."""
+    def refuse(error, protected=None):
+        result = {"success": False, "host": conn["host"], "device_name": device_name, "error": error,
+                  "error_type": "StackwiseVirtualPort", "committed": False}
+        if protected is not None:
+            result["protected_ports"] = protected
+        return result
+
+    try:
+        wanted = _payload_interfaces(config_xml)
+    except Exception as e:
+        return refuse("could not read the interfaces in the config to check for StackWise Virtual ports "
+                      f"({type(e).__name__}): refusing. Nothing was staged or committed.")
+    if not wanted:
+        return None
+    by_type = {}
+    for kind, name in wanted:
+        by_type.setdefault(kind, []).append(name)
+    selection = "".join(f"<{kind}><name>{_xml_escape(name)}</name></{kind}>" for kind, names in by_type.items() for name in names)
+    flt = f'<native xmlns="{_NATIVE_NS}"><interface>{selection}</interface></native>'
+    try:
+        reply = m.get_config(source="running", filter=("subtree", flt))
+        tree = _etree.fromstring(reply.data_xml.encode("utf-8"))
+        protected = []
+        for interface in tree.iter("{%s}interface" % _NATIVE_NS):
+            for entry in interface:
+                if not isinstance(entry.tag, str):
+                    continue
+                if any(isinstance(c.tag, str) and _etree.QName(c).localname == "stackwise-virtual" for c in entry):
+                    name = entry.find("{%s}name" % _NATIVE_NS)
+                    item = (_etree.QName(entry).localname, (name.text or "").strip() if name is not None else "")
+                    if item in wanted:
+                        protected.append(item[0] + item[1])
+    except Exception as e:
+        return refuse("could not read the running config to check for StackWise Virtual ports "
+                      f"({type(e).__name__}: {e}): refusing. Nothing was staged or committed.")
+    if not protected:
+        return None
+    protected = [k + n for k, n in wanted if k + n in protected]   # payload order
+    return refuse("the config would change StackWise Virtual port(s) on the device: " + ", ".join(protected) + ". "
+                  "These ports hold the two switches together; changing them can split the pair. Mark them excludeConfig in "
+                  "NetBox so the template leaves them out. Nothing was staged or committed.", protected)
+
+
 class _Steps:
     """Wall-clock laps of one preview, reported as timings.steps / timings.driver_total_s so a live
     run shows where the time goes (a live run on a Catalyst 9500 stack took ~222 s while the two CLI renders added up to
@@ -829,6 +903,11 @@ def _preview_config(conn, args, config_xml) -> dict:
                 return {"success": False, "host": conn["host"], "device_name": device_name,
                         "error": "device has no candidate datastore — netconf-preview-config requires it"}
 
+            blocked = _stackwise_guard(m, conn, device_name, config_xml)
+            steps.lap("stackwise_guard")
+            if blocked:
+                return blocked
+
             # The CLI render of RUNNING is the slowest device-side step and needs neither the lock nor the
             # edit, so it runs in a second read-only session from the start, hidden behind the staging work
             # (measured on a C9500 stack: ~36 s render).
@@ -1039,6 +1118,9 @@ def _send_config_xml(conn, args, config_xml) -> dict:
 
     try:
         with _session(conn) as m:
+            blocked = _stackwise_guard(m, conn, device_name, config_xml)
+            if blocked:
+                return blocked
             drift_check = "none"
             if expect_running_hash:
                 # Drift guard: caller captured running_hash from an earlier

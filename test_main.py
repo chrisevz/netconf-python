@@ -1791,6 +1791,142 @@ class ChunkedPayloadTests(unittest.TestCase):
             self.assertNotIn("config_xml_part_41", props)
 
 
+class StackwiseVirtualGuardTests(unittest.TestCase):
+    """StackWise Virtual ports (running carries native/interface/<Type>/stackwise-virtual) are never touched. The shape is the
+    live capture of a StackWise Virtual pair: FortyGigabitEthernet 1/0/24 (link), 1/0/23 and 1/0/13 (dual-active-detection)."""
+
+    NS = "http://cisco.com/ns/yang/Cisco-IOS-XE-native"
+    RUNNING = f"""<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><native xmlns="{NS}"><interface>
+      <FortyGigabitEthernet><name>1/0/24</name><stackwise-virtual><link>1</link></stackwise-virtual></FortyGigabitEthernet>
+      <FortyGigabitEthernet><name>1/0/23</name><stackwise-virtual><dual-active-detection/></stackwise-virtual></FortyGigabitEthernet>
+      <FortyGigabitEthernet><name>1/0/13</name><stackwise-virtual><dual-active-detection/></stackwise-virtual></FortyGigabitEthernet>
+      <FortyGigabitEthernet><name>1/0/5</name><description>x</description></FortyGigabitEthernet>
+      </interface></native></data>"""
+    CONN = {"host": "192.0.2.1", "lock_timeout": 1, "lock_poll_interval": 0.1, "device_name": "dev1"}
+
+    @staticmethod
+    def cfg(*entries):
+        body = "".join(f"<{k}><name>{n}</name><description>d</description></{k}>" for k, n in entries)
+        return f'<config><native xmlns="{StackwiseVirtualGuardTests.NS}"><interface>{body}</interface></native></config>'
+
+    def session(self, running=None, error=None):
+        m = MagicMock()
+        m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0"]
+        if error is not None:
+            m.get_config.side_effect = error
+        else:
+            m.get_config.return_value = MagicMock(data_xml=self.RUNNING if running is None else running)
+        s = MagicMock()
+        s.__enter__.return_value = m
+        return m, s
+
+    def run_op(self, op, config, parts=None, **kw):
+        m, s = self.session(**kw)
+        args = ChunkedPayloadTests._args(parts or [config], config_xml_parts=len(parts) if parts else None,
+                                         expect_running_hash=None, confirm_timeout=None)
+        with patch.object(main, "_session", return_value=s), \
+             patch.object(main, "_acquire_candidate_lock", return_value=0.0) as lock, \
+             patch.object(main, "_start_background_render") as render:
+            return op(self.CONN, args), m, lock, render
+
+    def assert_refused(self, r, m, lock, render, ports):
+        self.assertFalse(r["success"])
+        self.assertEqual(r["error_type"], "StackwiseVirtualPort")
+        self.assertFalse(r["committed"])
+        self.assertEqual(r["protected_ports"], ports)
+        for p in ports:
+            self.assertIn(p, r["error"])
+        self.assertIn("excludeConfig", r["error"])
+        self.assertIn("Nothing was staged or committed.", r["error"])
+        lock.assert_not_called()
+        render.assert_not_called()
+        m.edit_config.assert_not_called()
+        m.lock.assert_not_called()
+        m.commit.assert_not_called()
+
+    def test_touching_a_stackwise_port_is_refused_before_lock_and_edit(self):
+        for op in (main.preview_config, main.send_config_xml):
+            r, m, lock, render = self.run_op(op, self.cfg(("FortyGigabitEthernet", "1/0/24")))
+            self.assert_refused(r, m, lock, render, ["FortyGigabitEthernet1/0/24"])
+            self.assertEqual(r["payload"]["parts"], 1)
+
+    def test_all_six_kinds_listed_in_payload_order(self):
+        cfg = self.cfg(("FortyGigabitEthernet", "1/0/5"), ("FortyGigabitEthernet", "1/0/23"), ("FortyGigabitEthernet", "1/0/24"),
+                       ("FortyGigabitEthernet", "1/0/13"))
+        r, m, lock, render = self.run_op(main.send_config_xml, cfg)
+        self.assert_refused(r, m, lock, render, ["FortyGigabitEthernet1/0/23", "FortyGigabitEthernet1/0/24", "FortyGigabitEthernet1/0/13"])
+
+    def test_filter_is_the_proven_name_selection_form_built_from_the_payload(self):
+        cfg = self.cfg(("FortyGigabitEthernet", "1/0/5"), ("Port-channel", "5"), ("Vlan", "40"))
+        m, s = self.session()
+        self.assertIsNone(main._stackwise_guard(m, self.CONN, "d", cfg))
+        kw = m.get_config.call_args.kwargs
+        self.assertEqual(kw["source"], "running")
+        self.assertEqual(kw["filter"], ("subtree", f'<native xmlns="{self.NS}"><interface><FortyGigabitEthernet><name>1/0/5</name>'
+                                        '</FortyGigabitEthernet><Port-channel><name>5</name></Port-channel><Vlan><name>40</name></Vlan>'
+                                        '</interface></native>'))
+        self.assertNotIn("stackwise-virtual", kw["filter"][1])
+
+    def test_only_non_stackwise_ports_proceed_exactly_as_before(self):
+        cfg = self.cfg(("FortyGigabitEthernet", "1/0/5"), ("FortyGigabitEthernet", "2/0/1"))
+        m, s = self.session()
+        with patch.object(main, "_session", return_value=s), patch.object(main, "_acquire_candidate_lock", return_value=0.0):
+            r = main.send_config_xml(self.CONN, ChunkedPayloadTests._args([cfg], expect_running_hash=None, confirm_timeout=None))
+        self.assertTrue(r["success"], r)
+        self.assertEqual(m.edit_config.call_args.kwargs["config"], cfg)
+        m.get_config.assert_called_once()
+
+    def test_mix_of_types_only_the_stackwise_one_is_named(self):
+        cfg = self.cfg(("Port-channel", "5"), ("FortyGigabitEthernet", "1/0/24"), ("Vlan", "40"), ("TenGigabitEthernet", "1/0/1"))
+        r, m, lock, render = self.run_op(main.preview_config, cfg)
+        self.assert_refused(r, m, lock, render, ["FortyGigabitEthernet1/0/24"])
+
+    def test_stackwise_on_another_type_is_found_too(self):
+        running = f'<data xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><native xmlns="{self.NS}"><interface><TenGigabitEthernet><name>1/0/1</name><stackwise-virtual><link>2</link></stackwise-virtual></TenGigabitEthernet></interface></native></data>'
+        r, m, lock, render = self.run_op(main.send_config_xml, self.cfg(("TenGigabitEthernet", "1/0/1")), running=running)
+        self.assert_refused(r, m, lock, render, ["TenGigabitEthernet1/0/1"])
+
+    def test_parts_mode_is_checked_on_the_joined_config(self):
+        cfg = self.cfg(("FortyGigabitEthernet", "1/0/5"), ("FortyGigabitEthernet", "1/0/24"))
+        cut = cfg.index("<FortyGigabitEthernet><name>1/0/24")
+        for op in (main.preview_config, main.send_config_xml):
+            r, m, lock, render = self.run_op(op, cfg, parts=[cfg[:cut], cfg[cut:]])
+            self.assert_refused(r, m, lock, render, ["FortyGigabitEthernet1/0/24"])
+            self.assertEqual(r["payload"]["parts"], 2)
+
+    def test_a_failed_or_unparseable_running_read_refuses(self):
+        for kw in (dict(error=RuntimeError("rpc timeout")), dict(running="not xml"), dict(running="")):
+            for op in (main.preview_config, main.send_config_xml):
+                r, m, lock, render = self.run_op(op, self.cfg(("FortyGigabitEthernet", "1/0/5")), **kw)
+                self.assertFalse(r["success"])
+                self.assertEqual((r["error_type"], r["committed"]), ("StackwiseVirtualPort", False))
+                self.assertNotIn("protected_ports", r)
+                self.assertIn("refusing", r["error"])
+                lock.assert_not_called()
+                m.edit_config.assert_not_called()
+
+    def test_nxos_and_legacy_payloads_do_no_read(self):
+        nx = '<config><System xmlns="http://cisco.com/ns/nxos"><name>sw</name></System></config>'
+        for cfg in (nx, "<config/>", "<a>1</a>"):
+            m, s = self.session()
+            self.assertIsNone(main._stackwise_guard(m, self.CONN, "d", cfg))
+            m.get_config.assert_not_called()
+
+    def test_entries_of_the_native_namespace_only(self):
+        other = '<config><interface xmlns="urn:other"><FortyGigabitEthernet><name>1/0/24</name></FortyGigabitEthernet></interface></config>'
+        self.assertEqual(main._payload_interfaces(other), [])
+        self.assertEqual(main._payload_interfaces(self.cfg(("A", "1"), ("A", "1"), ("B", "2"))), [("A", "1"), ("B", "2")])
+
+    def test_preview_timings_name_the_step(self):
+        m, s = self.session()
+        args = ChunkedPayloadTests._args([self.cfg(("FortyGigabitEthernet", "1/0/24"))], force_discard=False, diff=True)
+        seen = []
+        real = main._Steps.lap
+        with patch.object(main, "_session", return_value=s), patch.object(main._Steps, "lap", lambda self_, n: (seen.append(n), real(self_, n))[1]):
+            main.preview_config(self.CONN, args)
+        self.assertIn("stackwise_guard", seen)
+
+
 class FormatForHumansTests(unittest.TestCase):
     def test_is_alive_returns_full_json_including_version(self):
         result = {"success": True, "alive": True, "host": "192.0.2.1", "output": "17.15"}
