@@ -447,6 +447,113 @@ def _unresolved_secret_placeholder(config_xml, conn, device_name):
             "error_type": "UnresolvedSecretPlaceholder", "committed": False}
 
 
+# Payloads above ~128 KiB cannot travel as ONE command-line argument (Linux MAX_ARG_STRLEN = 131072 bytes per
+# argument; the gateway then returns return_code -255 without starting the script). The caller may therefore
+# send config_xml in up to MAX_CONFIG_XML_PARTS pieces (config_xml, config_xml_part_2 ... config_xml_part_40)
+# and say how many with config_xml_parts. The pieces are joined here, before any device connection.
+MAX_CONFIG_XML_PARTS = 40
+
+
+class PayloadAssemblyError(Exception):
+    """config_xml could not be put back together from its parts. Never carries config text."""
+
+
+def _config_xml_part(args, n):
+    value = getattr(args, "config_xml" if n == 1 else f"config_xml_part_{n}", None)
+    return value if isinstance(value, str) else ""
+
+
+def _assemble_config_xml(args):
+    """Return (config_xml, parts_count) for the call.
+
+    No config_xml_parts: legacy mode, config_xml exactly as received (parts_count 1); any config_xml_part_N
+    without config_xml_parts fails closed. With config_xml_parts = n (integer 1..40): config_xml and
+    config_xml_part_2..n must all be non-empty, parts n+1..40 must be empty, every part but the last must end
+    with '>', the joined text must not contain a U+FFFD replacement character (a damaged character), and it must parse
+    as XML with a <config> root. Raises PayloadAssemblyError (the
+    message names the part, never the content)."""
+    declared = getattr(args, "config_xml_parts", None)
+    if not isinstance(declared, (int, str)):  # unset (argparse gives None or a string, never another type)
+        declared = None
+    if declared is None or declared == "":
+        extra = [n for n in range(2, MAX_CONFIG_XML_PARTS + 1) if _config_xml_part(args, n)]
+        if extra:
+            raise PayloadAssemblyError(
+                f"config_xml_part_{extra[0]} was sent without config_xml_parts: refusing to guess how the "
+                "payload fits together.")
+        return getattr(args, "config_xml", None) or "", 1
+    if isinstance(declared, bool):
+        raise PayloadAssemblyError(f"config_xml_parts must be an integer 1..{MAX_CONFIG_XML_PARTS}, got {declared!r}.")
+    try:
+        n = int(declared)
+    except (TypeError, ValueError):
+        raise PayloadAssemblyError(
+            f"config_xml_parts must be an integer 1..{MAX_CONFIG_XML_PARTS}, got {declared!r}.") from None
+    if not 1 <= n <= MAX_CONFIG_XML_PARTS:
+        raise PayloadAssemblyError(f"config_xml_parts must be an integer 1..{MAX_CONFIG_XML_PARTS}, got {n}.")
+    names = ["config_xml"] + [f"config_xml_part_{i}" for i in range(2, n + 1)]
+    parts = [_config_xml_part(args, i) for i in range(1, n + 1)]
+    for i, part in enumerate(parts, start=1):
+        if not part:
+            raise PayloadAssemblyError(f"part {i} of {n} is missing or empty ({names[i - 1]}).")
+    for i in range(n + 1, MAX_CONFIG_XML_PARTS + 1):
+        if _config_xml_part(args, i):
+            raise PayloadAssemblyError(
+                f"config_xml_part_{i} is set but config_xml_parts is {n}: the part count does not match.")
+    for i, part in enumerate(parts[:-1], start=1):
+        if not part.endswith(">"):
+            raise PayloadAssemblyError(f"part {i} of {n} does not end with '>': the payload was cut inside a tag or text.")
+    joined = "".join(parts)
+    if "\ufffd" in joined:
+        raise PayloadAssemblyError(
+            "the joined payload contains a U+FFFD replacement character: a character was damaged on the way "
+            "(a text-encoding error before the driver).")
+    try:
+        root = _etree.fromstring(
+            joined.encode("utf-8"),
+            _etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=True))
+    except (_etree.XMLSyntaxError, ValueError) as e:
+        raise PayloadAssemblyError(f"the {n} parts joined together are not well-formed XML: {e}") from None
+    if _etree.QName(root).localname != "config":
+        raise PayloadAssemblyError(
+            f"the joined payload must have a <config> root element, found <{_etree.QName(root).localname}>.")
+    return joined, n
+
+
+def _with_payload(result, joined, parts, include_sha256):
+    """Add payload {parts, length} (and, for the preview only, sha256) to a result. The push never carries a
+    hash: the payload holds real secrets and a hash of it could be tested against guesses."""
+    if isinstance(result, dict):
+        result["payload"] = {"parts": parts, "length": len(joined)}
+        if include_sha256:
+            result["payload"]["sha256"] = hashlib.sha256(joined.encode("utf-8")).hexdigest()
+    return result
+
+
+def _guarded_payload_call(conn, args, op_name, include_sha256, run):
+    """Shared front of netconf-preview-config and netconf-send-config-xml: assemble config_xml, answer
+    payload_check_only without touching the device, otherwise run the op with the assembled text."""
+    device_name = conn.get("device_name") or conn["host"]
+    check_only = getattr(args, "payload_check_only", False) is True
+    try:
+        config_xml, parts = _assemble_config_xml(args)
+    except PayloadAssemblyError as e:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": f"config_xml could not be assembled: {e} Nothing was sent to the device.",
+                "error_type": "PayloadAssemblyError", "committed": False}
+    if not config_xml:
+        return {"success": False, "host": conn["host"], "device_name": device_name,
+                "error": f"config_xml is required for action={op_name}"}
+    if check_only:
+        result = {"success": True, "payload_check_only": True,
+                  "unresolved_placeholders": config_xml.count("$" + _SECRET_PLACEHOLDER + "(")}
+        return _with_payload(result, config_xml, parts, include_sha256)
+    unresolved = _unresolved_secret_placeholder(config_xml, conn, device_name)
+    if unresolved:
+        return _with_payload(unresolved, config_xml, parts, include_sha256)
+    return _with_payload(run(conn, args, config_xml), config_xml, parts, include_sha256)
+
+
 class _Steps:
     """Wall-clock laps of one preview, reported as timings.steps / timings.driver_total_s so a live
     run shows where the time goes (a live run on a Catalyst 9500 stack took ~222 s while the two CLI renders added up to
@@ -656,7 +763,7 @@ def _preview_render(m, running_xml: str, candidate_after_xml: str, background=No
     }
 
 
-def preview_config(conn, args) -> dict:
+def _preview_config(conn, args, config_xml) -> dict:
     """Stage a proposed config_xml change, diff it against running, and
     leave zero state on the device — all in one session.
 
@@ -710,13 +817,6 @@ def preview_config(conn, args) -> dict:
     reorder it back.
     """
     device_name = conn.get("device_name") or conn["host"]
-    config_xml = getattr(args, "config_xml", None)
-    if not config_xml:
-        return {"success": False, "host": conn["host"], "device_name": device_name,
-                "error": "config_xml is required for action=netconf-preview-config"}
-    unresolved = _unresolved_secret_placeholder(config_xml, conn, device_name)
-    if unresolved:
-        return unresolved
 
     force_discard = getattr(args, "force_discard", False)
     include_diff = getattr(args, "diff", True)
@@ -910,7 +1010,7 @@ def preview_config(conn, args) -> dict:
                 "committed": False}
 
 
-def send_config_xml(conn, args) -> dict:
+def _send_config_xml(conn, args, config_xml) -> dict:
     """Push config_xml for real: lock candidate, discard any stray staged
     content, edit, commit. The supported flow is netconf-preview-config
     (stage -> diff -> discard) followed by a separate call here — there is
@@ -933,13 +1033,6 @@ def send_config_xml(conn, args) -> dict:
     plain XML hash, as before. A candidate lock that cannot be taken ends in
     CandidateLocked, with nothing edited or committed."""
     device_name = conn.get("device_name") or conn["host"]
-    config_xml = getattr(args, "config_xml", None)
-    if not config_xml:
-        return {"success": False, "host": conn["host"], "device_name": device_name,
-                "error": "config_xml is required for action=netconf-send-config-xml"}
-    unresolved = _unresolved_secret_placeholder(config_xml, conn, device_name)
-    if unresolved:
-        return unresolved
     expect_running_hash = getattr(args, "expect_running_hash", None)
     confirm_timeout = getattr(args, "confirm_timeout", None)
     persist_id = uuid.uuid4().hex if confirm_timeout else None
@@ -1107,6 +1200,18 @@ def send_config_xml(conn, args) -> dict:
     except Exception as e:
         return {"success": False, "host": conn["host"], "device_name": device_name,
                 "error": str(e), "error_type": type(e).__name__}
+
+
+def preview_config(conn, args) -> dict:
+    """netconf-preview-config. config_xml may arrive in parts (see _assemble_config_xml); payload_check_only
+    answers after assembly without connecting. The staging flow itself is documented on _preview_config."""
+    return _guarded_payload_call(conn, args, "netconf-preview-config", True, _preview_config)
+
+
+def send_config_xml(conn, args) -> dict:
+    """netconf-send-config-xml. config_xml may arrive in parts (see _assemble_config_xml); payload_check_only
+    answers after assembly without connecting. The push flow itself is documented on _send_config_xml."""
+    return _guarded_payload_call(conn, args, "netconf-send-config-xml", False, _send_config_xml)
 
 
 def _rpc_failure(conn, device_name, e) -> dict:
@@ -1389,6 +1494,9 @@ _DISPATCH = {
 }
 
 
+_PAYLOAD_OPS = ("netconf-preview-config", "netconf-send-config-xml", "netconf-send-command")
+
+
 def _read_stdin_inventory():
     if sys.stdin.isatty():
         return None
@@ -1493,6 +1601,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="A complete, pre-built NETCONF <config> XML payload — pushed as-is via "
                              "edit-config. Required for netconf-preview-config and "
                              "netconf-send-config-xml.")
+    parser.add_argument("--config_xml_parts", "--config-xml-parts", dest="config_xml_parts", default=None,
+                        help="Optional. Number of pieces (1..40) config_xml was split into, because one "
+                             "command-line argument cannot exceed 128 KiB. The pieces are config_xml, "
+                             "config_xml_part_2 ... config_xml_part_N, joined in order.")
+    for _n in range(2, MAX_CONFIG_XML_PARTS + 1):
+        parser.add_argument(f"--config_xml_part_{_n}", f"--config-xml-part-{_n}", dest=f"config_xml_part_{_n}",
+                            default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--payload_check_only", "--payload-check-only", dest="payload_check_only", nargs="?",
+                        const=True, default=None,
+                        help="Default false. Assemble and check config_xml, report its size, then stop "
+                             "without connecting to the device.")
     parser.add_argument("--confirm_timeout", "--confirm-timeout", dest="confirm_timeout",
                         type=_optional_int, default=None,
                         help="netconf-send-config-xml only — seconds. If set, the commit is a persistent "
@@ -1509,7 +1628,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _normalize_args(args):
     for attr in ("source", "filter", "host", "user", "password", "config_xml", "expect_running_hash",
-                 "persist_id"):
+                 "persist_id", "config_xml_parts",
+                 *(f"config_xml_part_{n}" for n in range(2, MAX_CONFIG_XML_PARTS + 1))):
         if getattr(args, attr, None) == "":
             setattr(args, attr, None)
 
@@ -1521,6 +1641,12 @@ def _normalize_args(args):
         args.force_discard = False
     elif isinstance(val, str):
         args.force_discard = val.lower() in ("true", "1", "yes")
+
+    val = getattr(args, "payload_check_only", None)
+    if val is None or val == "":
+        args.payload_check_only = False
+    elif isinstance(val, str):
+        args.payload_check_only = val.lower() in ("true", "1", "yes")
 
     # diff defaults to True (netconf-preview-config includes the unified diff
     # unless explicitly turned off) — opposite polarity from force_discard,
@@ -1552,7 +1678,15 @@ def main() -> int:
         raise SystemExit("--op flag or NETCONF_OP env var must be set")
     _normalize_args(args)
     node = _read_stdin_inventory()
-    conn = _resolve_connection(args, node)
+    try:
+        conn = _resolve_connection(args, node)
+    except SystemExit:
+        # payload_check_only never opens a session, so it needs no device credentials: a call without an inventory
+        # node still answers. Every other call keeps failing on missing connection fields.
+        if not (args.payload_check_only and args.op in _PAYLOAD_OPS):
+            raise
+        conn = {"host": args.host or "(no device)", "port": 830, "user": None, "password": None, "timeout": 90,
+                "lock_timeout": 30, "lock_poll_interval": 2.0, "device_name": args.host or "(payload check only)"}
     result = _DISPATCH[args.op](conn, args)
     formatted = _format_for_humans(result, args.op)
     print(formatted)

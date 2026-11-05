@@ -49,6 +49,136 @@ decorators:
         config_xml:
           description: Raw pre-built NETCONF <config> XML payload to preview, pushed as-is into candidate then discarded.
           type: string
+        config_xml_parts:
+          description: >-
+            Optional. How many pieces config_xml was split into (1 to 40), because
+            one command-line argument cannot exceed 128 KiB. The pieces are
+            config_xml, config_xml_part_2 ... config_xml_part_N, joined in order
+            and checked before anything is sent. Empty = config_xml is the whole payload.
+          type: integer
+          minimum: 1
+          maximum: 40
+        config_xml_part_2:
+          description: Piece 2 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_3:
+          description: Piece 3 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_4:
+          description: Piece 4 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_5:
+          description: Piece 5 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_6:
+          description: Piece 6 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_7:
+          description: Piece 7 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_8:
+          description: Piece 8 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_9:
+          description: Piece 9 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_10:
+          description: Piece 10 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_11:
+          description: Piece 11 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_12:
+          description: Piece 12 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_13:
+          description: Piece 13 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_14:
+          description: Piece 14 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_15:
+          description: Piece 15 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_16:
+          description: Piece 16 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_17:
+          description: Piece 17 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_18:
+          description: Piece 18 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_19:
+          description: Piece 19 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_20:
+          description: Piece 20 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_21:
+          description: Piece 21 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_22:
+          description: Piece 22 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_23:
+          description: Piece 23 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_24:
+          description: Piece 24 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_25:
+          description: Piece 25 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_26:
+          description: Piece 26 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_27:
+          description: Piece 27 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_28:
+          description: Piece 28 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_29:
+          description: Piece 29 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_30:
+          description: Piece 30 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_31:
+          description: Piece 31 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_32:
+          description: Piece 32 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_33:
+          description: Piece 33 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_34:
+          description: Piece 34 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_35:
+          description: Piece 35 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_36:
+          description: Piece 36 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_37:
+          description: Piece 37 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_38:
+          description: Piece 38 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_39:
+          description: Piece 39 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_40:
+          description: Piece 40 of config_xml. Only with config_xml_parts.
+          type: string
+        payload_check_only:
+          description: Default false. Assemble and check config_xml, report its size (parts, length) and stop without connecting to the device. Empty = false.
+          type: string
+          enum: ["", "true", "false"]
         force_discard:
           description: Default false. If the candidate datastore is already dirty (differs from running — another session's uncommitted work), discard it and proceed instead of returning error_type=DirtyCandidate. Empty = false.
           type: string
@@ -79,6 +209,136 @@ decorators:
         config_xml:
           description: A complete, pre-built NETCONF <config> XML payload, valid for the target device's YANG model. Pushed as-is via edit-config, then committed.
           type: string
+        config_xml_parts:
+          description: >-
+            Optional. How many pieces config_xml was split into (1 to 40), because
+            one command-line argument cannot exceed 128 KiB. The pieces are
+            config_xml, config_xml_part_2 ... config_xml_part_N, joined in order
+            and checked before anything is sent. Empty = config_xml is the whole payload.
+          type: integer
+          minimum: 1
+          maximum: 40
+        config_xml_part_2:
+          description: Piece 2 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_3:
+          description: Piece 3 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_4:
+          description: Piece 4 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_5:
+          description: Piece 5 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_6:
+          description: Piece 6 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_7:
+          description: Piece 7 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_8:
+          description: Piece 8 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_9:
+          description: Piece 9 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_10:
+          description: Piece 10 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_11:
+          description: Piece 11 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_12:
+          description: Piece 12 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_13:
+          description: Piece 13 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_14:
+          description: Piece 14 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_15:
+          description: Piece 15 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_16:
+          description: Piece 16 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_17:
+          description: Piece 17 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_18:
+          description: Piece 18 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_19:
+          description: Piece 19 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_20:
+          description: Piece 20 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_21:
+          description: Piece 21 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_22:
+          description: Piece 22 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_23:
+          description: Piece 23 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_24:
+          description: Piece 24 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_25:
+          description: Piece 25 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_26:
+          description: Piece 26 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_27:
+          description: Piece 27 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_28:
+          description: Piece 28 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_29:
+          description: Piece 29 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_30:
+          description: Piece 30 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_31:
+          description: Piece 31 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_32:
+          description: Piece 32 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_33:
+          description: Piece 33 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_34:
+          description: Piece 34 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_35:
+          description: Piece 35 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_36:
+          description: Piece 36 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_37:
+          description: Piece 37 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_38:
+          description: Piece 38 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_39:
+          description: Piece 39 of config_xml. Only with config_xml_parts.
+          type: string
+        config_xml_part_40:
+          description: Piece 40 of config_xml. Only with config_xml_parts.
+          type: string
+        payload_check_only:
+          description: Default false. Assemble and check config_xml, report its size (parts, length) and stop without connecting to the device. Empty = false.
+          type: string
+          enum: ["", "true", "false"]
         expect_running_hash:
           description: >-
             Optional drift guard. Pass the running_hash returned by a prior

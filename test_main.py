@@ -9,6 +9,7 @@ render RPC rather than failing.
 """
 
 import json
+import sys
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -1540,6 +1541,254 @@ class ExistingConfigCheckTests(unittest.TestCase):
 
     def test_registered_in_dispatch(self):
         self.assertIs(main._DISPATCH["netconf-existing-config-check"], main.existing_config_check)
+
+
+class ChunkedPayloadTests(unittest.TestCase):
+    """config_xml split over config_xml_part_2..40 (one command-line argument cannot exceed 128 KiB) and the
+    payload_check_only mode. Everything is decided before any device connection."""
+
+    CONN = {"host": "192.0.2.1", "lock_timeout": 1, "lock_poll_interval": 0.1, "device_name": "dev1"}
+
+    @staticmethod
+    def _args(parts=None, check_only=None, **kw):
+        """A Namespace like main() builds (parts = list of strings: config_xml, part_2, ...)."""
+        import argparse
+        ns = argparse.Namespace(config_xml=None, config_xml_parts=None, payload_check_only=check_only,
+                                expect_running_hash=None, confirm_timeout=None, force_discard=False, diff=True)
+        for n in range(2, 41):
+            setattr(ns, f"config_xml_part_{n}", None)
+        for i, part in enumerate(parts or [], start=1):
+            setattr(ns, "config_xml" if i == 1 else f"config_xml_part_{i}", part)
+        for k, v in kw.items():
+            setattr(ns, k, v)
+        return ns
+
+    XML = "<config><a>1</a><b>2</b><c>3</c></config>"
+    PARTS = ["<config><a>1</a>", "<b>2</b>", "<c>3</c></config>"]
+
+    # ---- assembly
+    def test_legacy_mode_returns_config_xml_exactly_and_does_not_parse_it(self):
+        for text in (self.XML, "not xml at all", "  <config/>\n"):
+            self.assertEqual(main._assemble_config_xml(self._args([text])), (text, 1))
+        self.assertEqual(main._assemble_config_xml(self._args()), ("", 1))
+
+    def test_part_without_count_fails_closed(self):
+        with self.assertRaises(main.PayloadAssemblyError) as cm:
+            main._assemble_config_xml(self._args([self.XML, "<b/>"]))
+        self.assertIn("config_xml_part_2", str(cm.exception))
+
+    def test_parts_are_joined_in_order(self):
+        self.assertEqual(main._assemble_config_xml(self._args(self.PARTS, config_xml_parts="3")), (self.XML, 3))
+        self.assertEqual(main._assemble_config_xml(self._args(self.PARTS, config_xml_parts=3)), (self.XML, 3))
+        self.assertEqual(main._assemble_config_xml(self._args([self.XML], config_xml_parts="1")), (self.XML, 1))
+
+    def test_count_must_be_an_integer_between_1_and_40(self):
+        for bad in ("0", "41", "-1", "abc", "2.5", True, 0, 41):
+            with self.assertRaises(main.PayloadAssemblyError, msg=repr(bad)):
+                main._assemble_config_xml(self._args(self.PARTS, config_xml_parts=bad))
+
+    def test_missing_or_empty_part_is_named(self):
+        for parts, which in (([self.PARTS[0], "", self.PARTS[2]], "part 2 of 3"), ([self.PARTS[0], self.PARTS[1]], "part 3 of 3"),
+                             ([None, self.PARTS[1], self.PARTS[2]], "part 1 of 3")):
+            with self.assertRaises(main.PayloadAssemblyError) as cm:
+                main._assemble_config_xml(self._args(parts, config_xml_parts="3"))
+            self.assertIn(which, str(cm.exception))
+
+    def test_part_beyond_the_count_fails(self):
+        args = self._args(self.PARTS, config_xml_parts="3", config_xml_part_7="<x/>")
+        with self.assertRaises(main.PayloadAssemblyError) as cm:
+            main._assemble_config_xml(args)
+        self.assertIn("config_xml_part_7", str(cm.exception))
+
+    def test_part_not_ending_with_gt_fails(self):
+        with self.assertRaises(main.PayloadAssemblyError) as cm:
+            main._assemble_config_xml(self._args(["<config><a>1</a", "><b/></config>"], config_xml_parts="2"))
+        self.assertIn("part 1 of 2", str(cm.exception))
+
+    def test_joined_must_be_wellformed_xml_with_config_root(self):
+        for parts in (["<config><a>", "</config>"], ["<root><a/>", "</root>"], ["<config><a/>", "<b/></config>trailing"]):
+            with self.assertRaises(main.PayloadAssemblyError, msg=parts):
+                main._assemble_config_xml(self._args(parts, config_xml_parts="2"))
+        ns = ["<config xmlns=\"urn:x\"><a/>", "</config>"]
+        self.assertEqual(main._assemble_config_xml(self._args(ns, config_xml_parts="2"))[1], 2)
+
+    def test_damaged_character_fails_closed_in_parts_mode_only(self):
+        with self.assertRaises(main.PayloadAssemblyError) as cm:
+            main._assemble_config_xml(self._args(["<config><a>caf\ufffd</a>", "</config>"], config_xml_parts="2"))
+        self.assertIn("U+FFFD", str(cm.exception))
+        # legacy mode is exactly as before: config_xml is passed on untouched
+        legacy = "<config><a>caf\ufffd</a></config>"
+        self.assertEqual(main._assemble_config_xml(self._args([legacy])), (legacy, 1))
+
+    def test_error_text_never_carries_config_content(self):
+        secret = "SECRET-VALUE-123"
+        with self.assertRaises(main.PayloadAssemblyError) as cm:
+            main._assemble_config_xml(self._args([f"<config><k>{secret}</k>", "</oops>"], config_xml_parts="2"))
+        self.assertNotIn(secret, str(cm.exception))
+
+    # ---- both ops: failure before any connection
+    def _no_device(self):
+        return patch.object(main, "_session"), patch.object(main.manager, "connect")
+
+    def test_bad_assembly_fails_without_connecting_on_both_ops(self):
+        for op in (main.preview_config, main.send_config_xml):
+            for check_only in (None, True):
+                args = self._args([self.PARTS[0], "", self.PARTS[2]], config_xml_parts="3", check_only=check_only)
+                sess, conn = self._no_device()
+                with sess as s, conn as c:
+                    r = op(self.CONN, args)
+                s.assert_not_called()
+                c.assert_not_called()
+                self.assertFalse(r["success"])
+                self.assertEqual(r["error_type"], "PayloadAssemblyError")
+                self.assertFalse(r["committed"])
+                self.assertIn("part 2 of 3", r["error"])
+                self.assertEqual(r["host"], "192.0.2.1")
+
+    # ---- payload_check_only
+    def test_check_only_answers_without_connecting_and_echoes_nothing(self):
+        text = "<config><k>$GATEWAYSECRET_(one)</k></config>"
+        for op, has_hash in ((main.preview_config, True), (main.send_config_xml, False)):
+            args = self._args(["<config>", "<k>$GATEWAYSECRET_(one)</k>", "</config>"], config_xml_parts=3, check_only=True)
+            sess, conn = self._no_device()
+            with sess as s, conn as c:
+                r = op(self.CONN, args)
+            s.assert_not_called()
+            c.assert_not_called()
+            self.assertEqual(set(r), {"success", "payload_check_only", "payload", "unresolved_placeholders"})
+            self.assertTrue(r["success"] and r["payload_check_only"] is True)
+            self.assertEqual(r["unresolved_placeholders"], 1)
+            self.assertEqual(r["payload"]["parts"], 3)
+            self.assertEqual(r["payload"]["length"], len(text))
+            self.assertEqual("sha256" in r["payload"], has_hash)
+            if has_hash:
+                import hashlib
+                self.assertEqual(r["payload"]["sha256"], hashlib.sha256(text.encode()).hexdigest())
+            self.assertNotIn("GATEWAYSECRET", json.dumps(r))
+
+    def test_check_only_legacy_mode_and_empty_config(self):
+        r = main.preview_config(self.CONN, self._args([self.XML], check_only=True))
+        self.assertEqual((r["success"], r["payload"]["parts"], r["payload"]["length"], r["unresolved_placeholders"]),
+                         (True, 1, len(self.XML), 0))
+        r = main.send_config_xml(self.CONN, self._args([], check_only=True))
+        self.assertFalse(r["success"])
+        self.assertIn("config_xml is required", r["error"])
+
+    def test_check_only_counts_resolved_secret_as_zero(self):
+        r = main.send_config_xml(self.CONN, self._args(self.PARTS, config_xml_parts=3, check_only=True))
+        self.assertEqual(r["unresolved_placeholders"], 0)
+
+    # ---- the ops get the joined text; legacy is untouched
+    def test_ops_receive_exactly_the_assembled_text(self):
+        for name, op, has_hash in (("_preview_config", main.preview_config, True), ("_send_config_xml", main.send_config_xml, False)):
+            with patch.object(main, name, return_value={"success": True, "x": 1}) as inner:
+                r = op(self.CONN, self._args(self.PARTS, config_xml_parts="3"))
+            self.assertEqual(inner.call_args[0][2], self.XML)
+            self.assertEqual(r["payload"]["parts"], 3)
+            self.assertEqual(r["payload"]["length"], len(self.XML))
+            self.assertEqual("sha256" in r["payload"], has_hash)
+            self.assertEqual(r["x"], 1)
+
+    def test_legacy_single_config_xml_reaches_the_op_unchanged(self):
+        odd = "<config>\n  <a>  é中文 -x </a>\n</config>\n"
+        for name, op in (("_preview_config", main.preview_config), ("_send_config_xml", main.send_config_xml)):
+            args = self._args([odd])
+            with patch.object(main, name, return_value={"success": True}) as inner:
+                r = op(self.CONN, args)
+            self.assertIs(inner.call_args[0][2], odd)
+            self.assertEqual(r["payload"], dict(parts=1, length=len(odd), **({"sha256": r["payload"]["sha256"]} if "sha256" in r["payload"] else {})))
+
+    def test_push_sends_the_same_bytes_to_the_device_in_legacy_and_parts_mode(self):
+        sent = []
+        for args in (self._args([self.XML]), self._args(self.PARTS, config_xml_parts="3")):
+            m = MagicMock()
+            m.server_capabilities = ["urn:ietf:params:netconf:capability:candidate:1.0"]
+            session = MagicMock()
+            session.__enter__.return_value = m
+            with patch.object(main, "_session", return_value=session), \
+                 patch.object(main, "_acquire_candidate_lock", return_value=0.0):
+                r = main.send_config_xml(self.CONN, args)
+            self.assertTrue(r["success"], r)
+            self.assertNotIn("sha256", r["payload"])
+            sent.append(m.edit_config.call_args.kwargs["config"])
+        self.assertEqual(sent[0], self.XML)
+        self.assertEqual(sent[0], sent[1])
+
+    def test_unresolved_placeholder_guard_runs_on_the_joined_text(self):
+        # the placeholder straddles nothing here, but it is only in part 2: the guard must still see it
+        args = self._args(["<config><a/>", "<k>$GATEWAYSECRET_(x)</k></config>"], config_xml_parts=2)
+        sess, conn = self._no_device()
+        with sess as s, conn as c:
+            r = main.send_config_xml(self.CONN, args)
+        s.assert_not_called()
+        self.assertEqual(r["error_type"], "UnresolvedSecretPlaceholder")
+        self.assertEqual(r["payload"]["parts"], 2)
+        self.assertNotIn("sha256", r["payload"])
+
+    def test_failure_results_from_the_op_carry_payload(self):
+        with patch.object(main, "_send_config_xml", return_value={"success": False, "error": "boom"}):
+            r = main.send_config_xml(self.CONN, self._args([self.XML]))
+        self.assertEqual(r["payload"], {"parts": 1, "length": len(self.XML)})
+
+    # ---- argparse
+    def test_argparse_takes_the_new_flags_and_normalizes_them(self):
+        argv = ["--op", "netconf-send-config-xml", "--config_xml", "<config><a/>", "--config_xml_part_2", "</config>",
+                "--config_xml_parts", "2", "--payload_check_only", "true"]
+        args = main.build_parser().parse_args(argv)
+        main._normalize_args(args)
+        self.assertEqual(main._assemble_config_xml(args), ("<config><a/></config>", 2))
+        self.assertIs(args.payload_check_only, True)
+        empty = main.build_parser().parse_args(["--op", "netconf-send-config-xml", "--config_xml_parts", "",
+                                                "--config_xml_part_9", "", "--payload_check_only", "false"])
+        main._normalize_args(empty)
+        self.assertIsNone(empty.config_xml_parts)
+        self.assertIsNone(empty.config_xml_part_9)
+        self.assertIs(empty.payload_check_only, False)
+        bare = main.build_parser().parse_args(["--op", "netconf-send-config-xml", "--payload_check_only"])
+        main._normalize_args(bare)
+        self.assertIs(bare.payload_check_only, True)
+        default = main.build_parser().parse_args(["--op", "netconf-send-config-xml"])
+        main._normalize_args(default)
+        self.assertIs(default.payload_check_only, False)
+
+    def test_main_answers_payload_check_only_without_device_credentials(self):
+        import io
+        import contextlib
+        argv = ["main.py", "--op", "netconf-preview-config", "--config_xml", "<config/>", "--payload_check_only", "true"]
+        for op, argv_op in (("netconf-preview-config", None), ("netconf-send-config-xml", "netconf-send-config-xml")):
+            a = list(argv)
+            if argv_op:
+                a[2] = argv_op
+            buf = io.StringIO()
+            with patch.object(sys, "argv", a), patch.object(main, "_read_stdin_inventory", return_value=None), \
+                 patch.object(main, "_session") as session, contextlib.redirect_stdout(buf):
+                code = main.main()
+            session.assert_not_called()
+            out = json.loads(buf.getvalue())
+            self.assertEqual((code, out["success"], out["payload_check_only"], out["payload"]["length"]), (0, True, True, 9))
+        # without payload_check_only the missing credentials still stop the call
+        with patch.object(sys, "argv", ["main.py", "--op", "netconf-preview-config", "--config_xml", "<config/>"]), \
+             patch.object(main, "_read_stdin_inventory", return_value=None):
+            with self.assertRaises(SystemExit):
+                main.main()
+
+    def test_import_yaml_declares_the_new_params_on_both_services(self):
+        import pathlib
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest('PyYAML not installed')
+        doc = yaml.safe_load((pathlib.Path(__file__).parent / "import.yaml").read_text())
+        decos = {d["name"]: d["schema"]["properties"] for d in doc["decorators"]}
+        for name in ("netconf-preview-config-input", "netconf-send-config-xml-input"):
+            props = decos[name]
+            self.assertEqual(props["config_xml_parts"]["type"], "integer")
+            self.assertEqual(props["payload_check_only"]["type"], "string")
+            self.assertEqual(props["payload_check_only"]["enum"], ["", "true", "false"])
+            self.assertNotIn("default", props["payload_check_only"])
+            for n in range(2, 41):
+                self.assertEqual(props[f"config_xml_part_{n}"]["type"], "string")
+            self.assertNotIn("config_xml_part_41", props)
 
 
 class FormatForHumansTests(unittest.TestCase):

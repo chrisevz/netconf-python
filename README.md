@@ -38,8 +38,8 @@ Each service reads the device from the gateway inventory and returns JSON with `
 |---|---|---|---|
 | `netconf-is-alive` | Checks NETCONF reachability and returns device facts | - | `alive`, `output` (software version), `platform`, `capabilities`, `persist_confirmed_commit` |
 | `netconf-get-config` | Reads running or candidate config as XML | `source`, `filter` | `config` |
-| `netconf-preview-config` | Stages `config_xml` in the candidate, diffs it against running, then discards it. Never commits | `config_xml`, `force_discard`, `diff`, `lock_timeout` | `diff`, `diff_rows`, `diff_stats`, `running_hash`, `preview_mode`, `timings` |
-| `netconf-send-config-xml` | Pushes `config_xml` (lock, edit, validate, commit) | `config_xml`, `expect_running_hash`, `confirm_timeout`, `lock_timeout` | `commit`, `confirmed_commit`, `drift_check`; with `confirm_timeout` also `persist_id`, `confirm_deadline_utc` |
+| `netconf-preview-config` | Stages `config_xml` in the candidate, diffs it against running, then discards it. Never commits | `config_xml` (or `config_xml_parts` + `config_xml_part_2..40`), `force_discard`, `diff`, `lock_timeout`, `payload_check_only` | `diff`, `diff_rows`, `diff_stats`, `running_hash`, `preview_mode`, `timings` |
+| `netconf-send-config-xml` | Pushes `config_xml` (lock, edit, validate, commit) | `config_xml` (or `config_xml_parts` + `config_xml_part_2..40`), `expect_running_hash`, `confirm_timeout`, `lock_timeout`, `payload_check_only` | `commit`, `confirmed_commit`, `drift_check`; with `confirm_timeout` also `persist_id`, `confirm_deadline_utc` |
 | `netconf-confirm-commit` | Makes a pending confirmed commit permanent | `persist_id` | `success` |
 | `netconf-cancel-commit` | Rolls a pending confirmed commit back now | `persist_id` | `success`, `rolled_back` |
 | `netconf-save-config` | Copies running to startup (write memory) | - | `method` |
@@ -74,6 +74,20 @@ Each service reads the device from the gateway inventory and returns JSON with `
 - **Secrets.** `netconf-preview-config` and `netconf-send-config-xml` refuse a `config_xml`
   that still contains an unresolved `$GATEWAYSECRET_` placeholder, so a literal
   placeholder is never sent to a device.
+- **Large payloads.** The gateway passes each parameter as one command-line argument, and
+  Linux refuses to start a program when one argument exceeds 128 KiB (the gateway then
+  returns `return_code` -255 with no output). To send a bigger `config_xml`, split it at
+  tag boundaries into up to 40 pieces: `config_xml` (piece 1), `config_xml_part_2` ...
+  `config_xml_part_40`, and set `config_xml_parts` to the number of pieces. The driver
+  joins them in order, checks that every piece is present, that every piece except the
+  last ends with `>`, and that the result is well-formed XML with a `<config>` root. Any
+  failure returns `error_type=PayloadAssemblyError` before a device connection is made.
+  Results carry `payload` (`parts`, `length`); the preview also carries `sha256` of the
+  joined payload. Without `config_xml_parts`, `config_xml` is used as given and a stray
+  `config_xml_part_N` is refused. `payload_check_only=true` assembles and checks the
+  payload, returns `payload` and `unresolved_placeholders` (a count) and stops without
+  connecting to a device (no inventory node is needed). A joined payload that holds a U+FFFD
+  replacement character (a damaged character) is refused.
 - **Existing-config check.** `netconf-existing-config-check` returns only short finding
   lines, never config text or keys.
 - **`preview_mode`** is always present. `device-rendered` is the device's own CLI text
